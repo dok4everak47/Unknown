@@ -1,0 +1,42 @@
+{
+  "unstable": {
+    "features": {
+      "hoverActions": true,
+      "runnables": true
+    }
+  },
+  "files": {
+    "excludeDirs": [
+      ".direnv",
+      "target",
+      "node_modules",
+      ".git"
+    ],
+    "excludeGlobs": [
+      "**/target/**",
+      "**/.direnv/**",
+      "**/Cargo.lock"
+    ]
+  },
+  "cargo": {
+    "buildScripts": {
+      "enable": true,
+      "invocationStrategy": "once",
+      "invocationLocation": "workspace"
+    },
+    "allFeatures": false,
+    "noDefaultFeatures": false
+  },
+  "diagnostics": {
+    "enable": true,
+    "experimental": {
+      "enable": false
+    }
+  },
+  "inlayHints": {
+    "enable": false,
+    "parameterHints": false,
+    "typeHints": false,
+    "chainingHints": false
+  }
+}

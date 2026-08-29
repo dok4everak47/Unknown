@@ -1,0 +1,12 @@
+.direnv/
+result
+target/
+.hermes-fix-backup-*/
+
+
+# Added by cargo
+
+/target
+
+# local secrets, never commit
+.env
