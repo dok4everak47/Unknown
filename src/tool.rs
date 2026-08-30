@@ -65,6 +65,28 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
+        ToolDefinition {
+            name: "edit_file",
+            description: "Replace an exact piece of text in a file. The path must be inside the project directory.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path of the file to edit, relative to the project root."
+                    },
+                    "old": {
+                        "type": "string",
+                        "description": "Exact text to find. Must occur exactly once in the file."
+                    },
+                    "new": {
+                        "type": "string",
+                        "description": "Replacement text for the matched `old`."
+                    }
+                },
+                "required": ["path", "old", "new"]
+            }),
+        },
     ]
 }
 
@@ -75,6 +97,10 @@ pub enum ToolError {
     InvalidArguments(String),
     NotFound(String),
     OutsideProject(String),
+    /// `edit_file` 的 `old` 文本在文件中不存在。
+    OldTextNotFound(String),
+    /// `edit_file` 的 `old` 文本在文件中出现多次，无法确定替换目标。
+    MultipleMatches(String),
     Io(io::Error),
 }
 
@@ -87,6 +113,11 @@ impl fmt::Display for ToolError {
             ToolError::OutsideProject(path) => {
                 write!(f, "access denied: {path} is outside the project directory")
             }
+            ToolError::OldTextNotFound(path) => write!(f, "old text not found in {path}"),
+            ToolError::MultipleMatches(path) => write!(
+                f,
+                "old text occurs multiple times in {path}; refusing to edit (exact replacement requires a single match)"
+            ),
             ToolError::Io(err) => write!(f, "io error: {err}"),
         }
     }
@@ -106,6 +137,7 @@ impl std::error::Error for ToolError {
 pub enum Tool {
     ReadFile(ReadFile),
     WriteFile(WriteFile),
+    EditFile(EditFile),
     Search(Search),
 }
 
@@ -124,6 +156,13 @@ pub struct WriteFile {
 pub struct Search {
     pub query: String,
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditFile {
+    pub path: String,
+    pub old: String,
+    pub new: String,
 }
 
 impl Tool {
@@ -165,6 +204,37 @@ impl Tool {
                     content: content.to_string(),
                 }))
             }
+            "edit_file" => {
+                let path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "edit_file requires a string argument `path`".to_string(),
+                        )
+                    })?;
+                let old = arguments
+                    .get("old")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "edit_file requires a string argument `old`".to_string(),
+                        )
+                    })?;
+                let new = arguments
+                    .get("new")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "edit_file requires a string argument `new`".to_string(),
+                        )
+                    })?;
+                Ok(Tool::EditFile(EditFile {
+                    path: path.to_string(),
+                    old: old.to_string(),
+                    new: new.to_string(),
+                }))
+            }
             "search" => {
                 let query = arguments
                     .get("query")
@@ -202,6 +272,9 @@ impl Tool {
                 write_file_within(root, &write_file.path, &write_file.content)
             }
             Tool::Search(search) => search_within(root, &search.query, search.path.as_deref()),
+            Tool::EditFile(edit_file) => {
+                edit_file_within(root, &edit_file.path, &edit_file.old, &edit_file.new)
+            }
         }
     }
 }
@@ -221,6 +294,42 @@ fn write_file_within(root: &Path, path: &str, content: &str) -> Result<String, T
     let resolved = resolve_within(root, path, true)?;
     fs::write(&resolved, content).map_err(ToolError::Io)?;
     Ok(format!("wrote {} bytes to {}", content.len(), path))
+}
+
+/// 精确替换文件中的一段文本，但限制路径必须位于 `root` 之内。
+///
+/// 语义：`old` 必须**恰好出现一次**（按 `str::matches` 的非重叠匹配计数）。
+///
+/// - 0 次 → [`ToolError::OldTextNotFound`]
+/// - 多次 → [`ToolError::MultipleMatches`]（拒绝修改，避免歧义）
+///
+/// 只有确认恰好一次之后才写回文件；任何失败路径都不会修改原文件。
+/// 第一版只处理有效 UTF-8 文本文件，不做编码检测。
+fn edit_file_within(root: &Path, path: &str, old: &str, new: &str) -> Result<String, ToolError> {
+    if old.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "edit_file requires a non-empty `old`".to_string(),
+        ));
+    }
+
+    let resolved = resolve_within(root, path, false)?;
+    let content = fs::read_to_string(&resolved).map_err(|err| match err.kind() {
+        // read_to_string 对非 UTF-8 文件返回 InvalidData
+        io::ErrorKind::InvalidData => {
+            ToolError::InvalidArguments(format!("{path} is not a valid UTF-8 text file"))
+        }
+        _ => ToolError::Io(err),
+    })?;
+
+    match content.matches(old).count() {
+        0 => return Err(ToolError::OldTextNotFound(path.to_string())),
+        1 => {}
+        _ => return Err(ToolError::MultipleMatches(path.to_string())),
+    }
+
+    let replaced = content.replacen(old, new, 1);
+    fs::write(&resolved, replaced).map_err(ToolError::Io)?;
+    Ok(format!("edited {path} successfully"))
 }
 
 /// 校验路径是否位于 `root` 之内，并返回 canonicalized 后的路径。
@@ -804,5 +913,333 @@ mod tests {
         let result = tool.execute_in(&root).unwrap();
         assert!(result.contains("text.rs:1:needle"));
         assert!(!result.contains("blob.bin"));
+    }
+
+    // ---------------- edit_file --------------
+
+    #[test]
+    fn from_call_parses_edit_file_arguments() {
+        let args = serde_json::json!({ "path": "src/main.rs", "old": "foo", "new": "bar" });
+        let tool = Tool::from_call("edit_file", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::EditFile(EditFile {
+                path: "src/main.rs".to_string(),
+                old: "foo".to_string(),
+                new: "bar".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn from_call_rejects_edit_file_missing_old() {
+        let args = serde_json::json!({ "path": "a.txt", "new": "bar" });
+        assert!(matches!(
+            Tool::from_call("edit_file", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn from_call_rejects_edit_file_missing_new() {
+        let args = serde_json::json!({ "path": "a.txt", "old": "foo" });
+        assert!(matches!(
+            Tool::from_call("edit_file", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn from_call_rejects_edit_file_missing_path() {
+        let args = serde_json::json!({ "old": "foo", "new": "bar" });
+        assert!(matches!(
+            Tool::from_call("edit_file", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn edit_replaces_single_occurrence() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "hello world\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "hello".to_string(),
+            new: "goodbye".to_string(),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("a.txt"));
+
+        let edited = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(edited, "goodbye world\n");
+    }
+
+    #[test]
+    fn edit_keeps_unmatched_text_intact() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "line one\nline two\nline three\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "line two".to_string(),
+            new: "LINE TWO".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        let edited = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(edited, "line one\nLINE TWO\nline three\n");
+    }
+
+    #[test]
+    fn edit_rejects_missing_old_text() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "hello world\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "zzz".to_string(),
+            new: "bar".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OldTextNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn edit_rejects_multiple_matches_and_leaves_file_unchanged() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "hello\nhello\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "hello".to_string(),
+            new: "goodbye".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::MultipleMatches(_))
+        ));
+
+        // 拒绝时不得修改原文件
+        let content = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(content, "hello\nhello\n");
+    }
+
+    #[test]
+    fn edit_rejects_overlapping_matches() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "aaaa").unwrap();
+
+        // "aa" 在 "aaaa" 中按非重叠匹配出现 2 次，应拒绝
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "aa".to_string(),
+            new: "b".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::MultipleMatches(_))
+        ));
+    }
+
+    #[test]
+    fn edit_allows_multiline_old_text() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "one\ntwo".to_string(),
+            new: "ONE\nTWO".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        let edited = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(edited, "ONE\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_text() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "hello\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "".to_string(),
+            new: "bar".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn edit_rejects_nonexistent_file() {
+        let root = temp_root();
+        let tool = Tool::EditFile(EditFile {
+            path: "missing.txt".to_string(),
+            old: "foo".to_string(),
+            new: "bar".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn edit_rejects_parent_traversal() {
+        let root = temp_root();
+        let tool = Tool::EditFile(EditFile {
+            path: "../../etc/passwd".to_string(),
+            old: "root".to_string(),
+            new: "x".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn edit_rejects_absolute_path() {
+        let root = temp_root();
+        let tool = Tool::EditFile(EditFile {
+            path: "/etc/passwd".to_string(),
+            old: "root".to_string(),
+            new: "x".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("myagent-edit-outside-{}", std::process::id()));
+        fs::write(&outside, "outside\n").unwrap();
+        symlink(&outside, root.join("link.txt")).unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "link.txt".to_string(),
+            old: "outside".to_string(),
+            new: "inside".to_string(),
+        });
+        let result = tool.execute_in(&root);
+
+        fs::remove_file(&outside).ok();
+        assert!(matches!(result, Err(ToolError::OutsideProject(_))));
+    }
+
+    #[test]
+    fn edit_rejects_non_utf8_file() {
+        let root = temp_root();
+        fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "blob.bin".to_string(),
+            old: "foo".to_string(),
+            new: "bar".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::InvalidArguments(_))
+        ));
+
+        // 非 UTF-8 文件保持不变
+        let bytes = fs::read(root.join("blob.bin")).unwrap();
+        assert_eq!(bytes, [0xff, 0xfe, 0x00]);
+    }
+
+    #[test]
+    fn edit_replaces_single_occurrence_of_repeated_word() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "foo and foo").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "foo".to_string(),
+            new: "bar".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::MultipleMatches(_))
+        ));
+    }
+
+    #[test]
+    fn edit_with_identical_old_and_new_is_noop() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "hello\n").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "hello".to_string(),
+            new: "hello".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        let edited = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(edited, "hello\n");
+    }
+
+    #[test]
+    fn edit_replaces_occurrence_inside_larger_text() {
+        let root = temp_root();
+        fs::write(root.join("a.txt"), "function foo() { return foo; }").unwrap();
+
+        let tool = Tool::EditFile(EditFile {
+            path: "a.txt".to_string(),
+            old: "return foo".to_string(),
+            new: "return bar".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        let edited = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert_eq!(edited, "function foo() { return bar; }");
+    }
+
+    #[test]
+    fn all_definitions_includes_edit_file() {
+        let defs = all_definitions();
+        let edit = defs
+            .iter()
+            .find(|d| d.name == "edit_file")
+            .unwrap();
+
+        assert_eq!(edit.name, "edit_file");
+        assert!(
+            edit.description
+                .contains("Replace an exact piece of text")
+        );
+        assert_eq!(edit.parameters["type"], "object");
+        assert_eq!(edit.parameters["properties"]["path"]["type"], "string");
+        assert_eq!(edit.parameters["properties"]["old"]["type"], "string");
+        assert_eq!(edit.parameters["properties"]["new"]["type"], "string");
+        assert_eq!(
+            edit.parameters["required"],
+            serde_json::json!(["path", "old", "new"])
+        );
+    }
+
+    #[test]
+    fn all_definitions_keeps_existing_tools() {
+        let defs = all_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"edit_file"));
     }
 }
