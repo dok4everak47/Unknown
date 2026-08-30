@@ -14,20 +14,58 @@ pub struct ToolDefinition {
 ///
 /// 后续新增工具时，在这里追加，并扩展 [`Tool`] 枚举与 [`Tool::from_call`]。
 pub fn all_definitions() -> Vec<ToolDefinition> {
-    vec![ToolDefinition {
-        name: "read_file",
-        description: "Read a file from the current project. The path must be inside the project directory.",
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path of the file to read, relative to the project root."
-                }
-            },
-            "required": ["path"]
-        }),
-    }]
+    vec![
+        ToolDefinition {
+            name: "read_file",
+            description: "Read a file from the current project. The path must be inside the project directory.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path of the file to read, relative to the project root."
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "write_file",
+            description: "Write a file to the current project. The path must be inside the project directory.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path of the file to write, relative to the project root."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file."
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "search",
+            description: "Search file contents within the project. Returns matching file paths, line numbers and line contents.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Substring to search for in file contents."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional file or directory path to limit the search, relative to the project root."
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
 }
 
 /// 工具执行或解析时的错误。
@@ -67,11 +105,25 @@ impl std::error::Error for ToolError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tool {
     ReadFile(ReadFile),
+    WriteFile(WriteFile),
+    Search(Search),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadFile {
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFile {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    pub query: String,
+    pub path: Option<String>,
 }
 
 impl Tool {
@@ -91,6 +143,47 @@ impl Tool {
                     path: path.to_string(),
                 }))
             }
+            "write_file" => {
+                let path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "write_file requires a string argument `path`".to_string(),
+                        )
+                    })?;
+                let content = arguments
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "write_file requires a string argument `content`".to_string(),
+                        )
+                    })?;
+                Ok(Tool::WriteFile(WriteFile {
+                    path: path.to_string(),
+                    content: content.to_string(),
+                }))
+            }
+            "search" => {
+                let query = arguments
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|q| !q.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "search requires a non-empty string argument `query`".to_string(),
+                        )
+                    })?;
+                let path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| s.to_string());
+                Ok(Tool::Search(Search {
+                    query: query.to_string(),
+                    path,
+                }))
+            }
             other => Err(ToolError::UnknownTool(other.to_string())),
         }
     }
@@ -105,6 +198,10 @@ impl Tool {
     fn execute_in(&self, root: &Path) -> Result<String, ToolError> {
         match self {
             Tool::ReadFile(read_file) => read_file_within(root, &read_file.path),
+            Tool::WriteFile(write_file) => {
+                write_file_within(root, &write_file.path, &write_file.content)
+            }
+            Tool::Search(search) => search_within(root, &search.query, search.path.as_deref()),
         }
     }
 }
@@ -113,6 +210,26 @@ impl Tool {
 ///
 /// 拒绝绝对路径、`..` 跳转，以及通过 symlink 逃逸出 `root` 的路径。
 fn read_file_within(root: &Path, path: &str) -> Result<String, ToolError> {
+    let resolved = resolve_within(root, path, false)?;
+    fs::read_to_string(&resolved).map_err(ToolError::Io)
+}
+
+/// 写入文件，但限制路径必须位于 `root` 之内。
+///
+/// 与 `read_file_within` 共用同一套路径边界校验。
+fn write_file_within(root: &Path, path: &str, content: &str) -> Result<String, ToolError> {
+    let resolved = resolve_within(root, path, true)?;
+    fs::write(&resolved, content).map_err(ToolError::Io)?;
+    Ok(format!("wrote {} bytes to {}", content.len(), path))
+}
+
+/// 校验路径是否位于 `root` 之内，并返回 canonicalized 后的路径。
+///
+/// 拒绝绝对路径、`..` 跳转，以及通过 symlink 逃逸出 `root` 的路径。
+///
+/// `allow_missing` 为 true 时（write 场景），目标文件可以尚不存在：
+/// 此时改由父目录的 canonicalized 路径参与边界判断，文件名拼接其后。
+fn resolve_within(root: &Path, path: &str, allow_missing: bool) -> Result<PathBuf, ToolError> {
     let candidate = PathBuf::from(path);
 
     if candidate.is_absolute() {
@@ -126,19 +243,106 @@ fn read_file_within(root: &Path, path: &str) -> Result<String, ToolError> {
     }
 
     let root = root.canonicalize().map_err(ToolError::Io)?;
-    let resolved = root
-        .join(&candidate)
-        .canonicalize()
-        .map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => ToolError::NotFound(path.to_string()),
-            _ => ToolError::Io(err),
-        })?;
+    let full = root.join(&candidate);
 
-    if !resolved.starts_with(&root) {
-        return Err(ToolError::OutsideProject(path.to_string()));
+    match full.canonicalize() {
+        Ok(resolved) => {
+            if !resolved.starts_with(&root) {
+                return Err(ToolError::OutsideProject(path.to_string()));
+            }
+            Ok(resolved)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound && allow_missing => {
+            // 目标文件尚不存在（write 场景）：校验父目录是否在 root 内
+            let parent = full
+                .parent()
+                .ok_or_else(|| ToolError::InvalidArguments(format!("invalid path: {path}")))?;
+            let parent = parent
+                .canonicalize()
+                .map_err(|err| match err.kind() {
+                    io::ErrorKind::NotFound => {
+                        ToolError::NotFound(format!("parent directory of {path}"))
+                    }
+                    _ => ToolError::Io(err),
+                })?;
+            if !parent.starts_with(&root) {
+                return Err(ToolError::OutsideProject(path.to_string()));
+            }
+            let file_name = full
+                .file_name()
+                .ok_or_else(|| ToolError::InvalidArguments(format!("invalid path: {path}")))?;
+            Ok(parent.join(file_name))
+        }
+        Err(err) => match err.kind() {
+            io::ErrorKind::NotFound => Err(ToolError::NotFound(path.to_string())),
+            _ => Err(ToolError::Io(err)),
+        },
+    }
+}
+
+/// 在 `root` 内搜索文件内容，返回 `path:line:content` 形式的匹配。
+///
+/// `path` 为 None 时从 `root` 开始递归搜索；为 Some 时限制在该路径
+/// （可以是文件或目录）范围内。结果中的路径相对于 `root`。
+fn search_within(root: &Path, query: &str, path: Option<&str>) -> Result<String, ToolError> {
+    let root = root.canonicalize().map_err(ToolError::Io)?;
+    let start = match path {
+        Some(p) => resolve_within(&root, p, false)?,
+        None => root.clone(),
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+
+    if start.is_file() {
+        search_file(&root, &start, query, &mut matches);
+    } else if start.is_dir() {
+        walk_dir(&root, &start, query, &mut matches);
+    } else {
+        return Err(ToolError::NotFound(path.unwrap_or(".").to_string()));
     }
 
-    fs::read_to_string(&resolved).map_err(ToolError::Io)
+    if matches.is_empty() {
+        Ok(format!("no matches for \"{query}\""))
+    } else {
+        Ok(matches.join("\n"))
+    }
+}
+
+/// 递归遍历目录，跳过无法读取的条目与 symlink（避免逃逸与循环）。
+fn walk_dir(root: &Path, dir: &Path, query: &str, matches: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            walk_dir(root, &path, query, matches);
+        } else if file_type.is_file() {
+            search_file(root, &path, query, matches);
+        }
+        // symlink 等其他类型不跟随、不搜索
+    }
+}
+
+/// 在单个文件内搜索，跳过二进制 / 非 UTF-8 / 无法读取的文件。
+fn search_file(root: &Path, file: &Path, query: &str, matches: &mut Vec<String>) {
+    let Ok(bytes) = fs::read(file) else {
+        return;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return;
+    };
+
+    for (index, line) in text.lines().enumerate() {
+        if line.contains(query) {
+            let rel = file.strip_prefix(root).unwrap_or(file);
+            matches.push(format!("{}:{}:{}", rel.display(), index + 1, line));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +459,7 @@ mod tests {
     fn from_call_rejects_unknown_tool() {
         let args = serde_json::json!({});
         assert!(matches!(
-            Tool::from_call("write_file", &args),
+            Tool::from_call("delete_file", &args),
             Err(ToolError::UnknownTool(_))
         ));
     }
@@ -267,5 +471,338 @@ mod tests {
             Tool::from_call("read_file", &args),
             Err(ToolError::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn from_call_parses_write_file_arguments() {
+        let args = serde_json::json!({ "path": "out.txt", "content": "hello" });
+        let tool = Tool::from_call("write_file", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::WriteFile(WriteFile {
+                path: "out.txt".to_string(),
+                content: "hello".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn from_call_rejects_write_file_missing_content() {
+        let args = serde_json::json!({ "path": "out.txt" });
+        assert!(matches!(
+            Tool::from_call("write_file", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn writes_file_inside_root() {
+        let root = temp_root();
+        let tool = Tool::WriteFile(WriteFile {
+            path: "out.txt".to_string(),
+            content: "hello world".to_string(),
+        });
+
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("out.txt"));
+
+        let written = fs::read_to_string(root.join("out.txt")).unwrap();
+        assert_eq!(written, "hello world");
+    }
+
+    #[test]
+    fn writes_file_in_subdirectory() {
+        let root = temp_root();
+        let sub = root.join("src");
+        fs::create_dir_all(&sub).unwrap();
+
+        let tool = Tool::WriteFile(WriteFile {
+            path: "src/lib.rs".to_string(),
+            content: "pub fn f() {}".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        let written = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(written, "pub fn f() {}");
+    }
+
+    #[test]
+    fn write_overwrites_existing_file() {
+        let root = temp_root();
+        fs::write(root.join("out.txt"), "old").unwrap();
+
+        let tool = Tool::WriteFile(WriteFile {
+            path: "out.txt".to_string(),
+            content: "new".to_string(),
+        });
+        tool.execute_in(&root).unwrap();
+
+        assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_rejects_parent_traversal() {
+        let root = temp_root();
+        let tool = Tool::WriteFile(WriteFile {
+            path: "../../etc/passwd".to_string(),
+            content: "evil".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn write_rejects_absolute_path() {
+        let root = temp_root();
+        let tool = Tool::WriteFile(WriteFile {
+            path: "/etc/passwd".to_string(),
+            content: "evil".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("myagent-write-outside-{}", std::process::id()));
+        fs::write(&outside, "outside").unwrap();
+        symlink(&outside, root.join("link.txt")).unwrap();
+
+        let tool = Tool::WriteFile(WriteFile {
+            path: "link.txt".to_string(),
+            content: "evil".to_string(),
+        });
+        let result = tool.execute_in(&root);
+
+        fs::remove_file(&outside).ok();
+        assert!(matches!(result, Err(ToolError::OutsideProject(_))));
+    }
+
+    #[test]
+    fn write_missing_parent_directory_reports_error() {
+        let root = temp_root();
+        let tool = Tool::WriteFile(WriteFile {
+            path: "no/such/dir/out.txt".to_string(),
+            content: "x".to_string(),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn search_finds_matches_with_path_and_line() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/model.rs"),
+            "pub struct Model {}\npub fn build() {}\n// Model again\n",
+        )
+        .unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "Model".to_string(),
+            path: None,
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("src/model.rs:1:pub struct Model {}"));
+        assert!(result.contains("src/model.rs:3:// Model again"));
+    }
+
+    #[test]
+    fn search_respects_path_scope() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("src/a.rs"), "needle here\n").unwrap();
+        fs::write(root.join("tests/b.rs"), "needle there\n").unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "needle".to_string(),
+            path: Some("src".to_string()),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("src/a.rs:1:needle here"));
+        assert!(!result.contains("tests/b.rs"));
+    }
+
+    #[test]
+    fn search_can_target_single_file() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "needle\n").unwrap();
+        fs::write(root.join("src/b.rs"), "other\n").unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "needle".to_string(),
+            path: Some("src/a.rs".to_string()),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("src/a.rs:1:needle"));
+        assert!(!result.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn search_reports_no_matches() {
+        let root = temp_root();
+        fs::write(root.join("a.rs"), "hello\n").unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "zzz".to_string(),
+            path: None,
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("no matches"));
+    }
+
+    #[test]
+    fn from_call_rejects_search_missing_query() {
+        let args = serde_json::json!({ "path": "src" });
+        assert!(matches!(
+            Tool::from_call("search", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn from_call_parses_search_arguments() {
+        let args = serde_json::json!({ "query": "foo" });
+        let tool = Tool::from_call("search", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::Search(Search {
+                query: "foo".to_string(),
+                path: None,
+            })
+        );
+
+        let args = serde_json::json!({ "query": "foo", "path": "src" });
+        let tool = Tool::from_call("search", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::Search(Search {
+                query: "foo".to_string(),
+                path: Some("src".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn search_rejects_parent_traversal() {
+        let root = temp_root();
+        let tool = Tool::Search(Search {
+            query: "x".to_string(),
+            path: Some("../../etc".to_string()),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn search_rejects_absolute_path() {
+        let root = temp_root();
+        let tool = Tool::Search(Search {
+            query: "x".to_string(),
+            path: Some("/etc".to_string()),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn search_rejects_nonexistent_path() {
+        let root = temp_root();
+        let tool = Tool::Search(Search {
+            query: "x".to_string(),
+            path: Some("missing".to_string()),
+        });
+        assert!(matches!(
+            tool.execute_in(&root),
+            Err(ToolError::NotFound(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("myagent-search-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.rs"), "needle\n").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "needle".to_string(),
+            path: Some("link".to_string()),
+        });
+        let result = tool.execute_in(&root);
+
+        fs::remove_dir_all(&outside).ok();
+        assert!(matches!(result, Err(ToolError::OutsideProject(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_follow_symlinks_during_walk() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = root.parent().unwrap().join(format!(
+            "myagent-search-walk-outside-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.rs"), "needle\n").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        // 从 root 递归搜索，不应跟随 link 进入 outside
+        let tool = Tool::Search(Search {
+            query: "needle".to_string(),
+            path: None,
+        });
+        let result = tool.execute_in(&root).unwrap();
+
+        fs::remove_dir_all(&outside).ok();
+        assert!(result.contains("no matches"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn search_skips_binary_files() {
+        let root = temp_root();
+        fs::write(root.join("text.rs"), "needle\n").unwrap();
+        fs::write(
+            root.join("blob.bin"),
+            [0x00, 0xff, 0xfe, b'n', b'e', b'e', b'd', b'l', b'e'],
+        )
+        .unwrap();
+
+        let tool = Tool::Search(Search {
+            query: "needle".to_string(),
+            path: None,
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("text.rs:1:needle"));
+        assert!(!result.contains("blob.bin"));
     }
 }

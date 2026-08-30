@@ -26,15 +26,15 @@ Nix
 - [x] Agent Loop
 - [x] Tool Calling（模型可发起工具调用）
 - [x] `read_file` 工具
+- [x] `write_file` 工具
+- [x] `search` 工具
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
 - [x] Nix Flake 开发环境
 
 尚未实现：
 
-- [ ] `write_file`
 - [ ] `edit_file`
-- [ ] `search`
 - [ ] `exec`
 - [ ] Nix Runtime
 - [ ] Sandbox
@@ -69,7 +69,7 @@ Final Response
 | --- | --- |
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
-| `src/tool.rs` | `Tool` 抽象 + `read_file` + 路径边界校验 |
+| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + 路径边界校验 |
 | `src/main.rs` | CLI 与 Agent Loop |
 
 ### 依赖方向
@@ -127,7 +127,7 @@ cargo test
 cargo clippy
 ```
 
-测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸）。测试不依赖外部 LLM。
+测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），以及 `read_file` / `write_file` / `search` 的工具执行。测试不依赖外部 LLM。
 
 ## Roadmap
 
@@ -147,7 +147,7 @@ Sandbox
 
 具体包括：
 
-- `write` / `edit` / `search` / `exec` 等更多工具
+- `edit` / `exec` 等更多工具
 - 更好的错误处理
 - streaming
 - sessions

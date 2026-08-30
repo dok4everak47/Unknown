@@ -44,7 +44,7 @@ Final Response
 src/main.rs      CLI 与 Agent Loop
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
-src/tool.rs      Tool 抽象 + read_file + 路径边界校验
+src/tool.rs      Tool 抽象 + read_file + write_file + search + 路径边界校验
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦：
@@ -305,6 +305,65 @@ Waiting for approval.
 
 报告完成后停止，不继续实现建议中的下一步。
 
+## README TODO Tracking
+
+`README.md` 必须包含一个 `TODO` / `Roadmap` 状态区域，用于记录项目的功能开发进度。
+
+每完成一个功能，都必须同步更新 `README.md` 中的 TODO：
+
+- 已完成的功能标记为 `[x]`
+- 尚未完成的功能标记为 `[ ]`
+- 只记录实际的功能状态
+- 不要把尚未实现的功能标记为完成
+
+例如：
+
+```markdown
+## TODO
+
+- [x] CLI
+- [x] Model abstraction
+- [x] OpenAI-compatible provider
+- [x] Multi-turn conversation
+- [x] Agent Loop
+- [x] Tool Calling
+- [x] read_file
+- [x] write_file
+- [x] search
+- [ ] exec
+- [ ] Runtime abstraction
+- [ ] Nix Runtime
+- [ ] Sandbox
+```
+
+### Workflow
+
+每完成一个功能：
+
+```text
+Implement feature
+      ↓
+cargo check
+      ↓
+Tests / verification
+      ↓
+Update README.md TODO
+      ↓
+Self-review
+      ↓
+Propose next step
+      ↓
+Wait for user approval
+```
+
+README TODO 的更新属于当前功能完成的一部分，不能遗漏。
+
+如果当前功能实际上没有完成，不得为了让 TODO 看起来完整而标记 `[x]`。
+
+AI 仍然必须遵守现有规则：
+
+> 完成当前功能后，可以根据 TODO 和项目状态提出下一步建议，但未经用户明确同意，不得实现下一步功能。
+
 ## Current Scope
 
 当前只实现：
@@ -315,6 +374,8 @@ Conversation
 Agent Loop
 Tool Calling
 read_file
+write_file
+search
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。
