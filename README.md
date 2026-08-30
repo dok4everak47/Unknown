@@ -29,13 +29,13 @@ Nix
 - [x] `write_file` 工具
 - [x] `search` 工具
 - [x] `edit_file` 工具（精确文本替换）
+- [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
 - [x] Nix Flake 开发环境
 
 尚未实现：
 
-- [ ] `exec`
 - [ ] Nix Runtime
 - [ ] Sandbox
 - [ ] Capability system
@@ -69,12 +69,13 @@ Final Response
 | --- | --- |
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
-| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + 路径边界校验 |
-| `src/main.rs` | CLI 与 Agent Loop |
+| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验 |
+| `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
+| `src/main.rs` | CLI entrypoint：读入用户输入，创建 Model / Agent，显示结果 |
 
 ### 依赖方向
 
-核心类型（`Message`）与 API 层类型（`ApiMessage`）分离；工具执行完全在 `tool.rs` 中，Model provider 不直接触碰文件系统：
+核心类型（`Message`）与 API 层类型（`ApiMessage`）分离；工具执行完全在 `tool.rs` 中，Model provider 不直接触碰文件系统；Agent Loop 只依赖 `Model` trait 与 `Tool` 的静态接口：
 
 ```text
 Model → Response::ToolCall → Agent → Tool → Filesystem
@@ -127,7 +128,18 @@ cargo test
 cargo clippy
 ```
 
-测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），以及 `read_file` / `write_file` / `search` / `edit_file` 的工具执行。测试不依赖外部 LLM。
+测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `edit_file` / `exec` 的工具执行，以及 Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限）。测试不依赖外部 LLM。
+
+## 关于 `exec` 的边界
+
+`exec` 目前是**受控的项目开发命令执行**，不是通用 shell：
+
+- 只允许白名单命令：`cargo check` / `cargo test` / `cargo build` / `cargo clippy` / `cargo fmt --check`
+- 不使用 shell（无 `sh -c` / `bash -c`），通过 `std::process::Command` 直接传可执行文件与参数
+- 命令在项目工作目录内执行，继承当前环境变量，模型无法修改环境
+- 单次执行 60 秒超时；stdout / stderr / 退出码全部返回给模型
+
+它**不是** sandbox，也不代表完整 command execution。
 
 ## Roadmap
 
@@ -147,7 +159,7 @@ Sandbox
 
 具体包括：
 
-- `exec` 等更多工具
+- 更多工具
 - 更好的错误处理
 - streaming
 - sessions

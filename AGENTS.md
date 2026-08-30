@@ -41,10 +41,11 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI 与 Agent Loop
+src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent）
+src/agent.rs     Agent Loop（Model ↔ Tool 协调、可注入 fake Model 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
-src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + 路径边界校验
+src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦：
@@ -377,6 +378,7 @@ read_file
 write_file
 search
 edit_file
+exec（受控开发命令，白名单）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。
@@ -386,7 +388,7 @@ edit_file
 除非任务明确要求，否则不要：
 
 - 添加新的 Tool
-- 添加 shell / exec
+- 添加 shell / exec（通用命令执行）
 - 添加 MCP
 - 添加 subagents
 - 添加 session persistence

@@ -1,7 +1,14 @@
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// `exec` 单次命令执行的最长时长。
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// `exec` 超时轮询间隔。
+const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 一个工具的参数 JSON Schema，用于请求中的 `tools` 字段。
 pub struct ToolDefinition {
@@ -87,6 +94,20 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "old", "new"]
             }),
         },
+        ToolDefinition {
+            name: "exec",
+            description: "Run an allowed project development command (cargo check/build/test/clippy/fmt --check). The command runs in the project directory and inherits the current environment.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Allowed project development command, e.g. \"cargo check\" or \"cargo test\"."
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
     ]
 }
 
@@ -101,6 +122,12 @@ pub enum ToolError {
     OldTextNotFound(String),
     /// `edit_file` 的 `old` 文本在文件中出现多次，无法确定替换目标。
     MultipleMatches(String),
+    /// `exec` 的命令不在允许列表内。
+    CommandNotAllowed(String),
+    /// `exec` 的命令执行超时（仅 stdout/stderr 被截断的部分）。
+    TimedOut(String),
+    /// `exec` 的命令以非零退出码结束，stdout/stderr 原样带回。
+    NonZeroExit(i32, String),
     Io(io::Error),
 }
 
@@ -118,6 +145,13 @@ impl fmt::Display for ToolError {
                 f,
                 "old text occurs multiple times in {path}; refusing to edit (exact replacement requires a single match)"
             ),
+            ToolError::CommandNotAllowed(command) => {
+                write!(f, "command not allowed: {command}")
+            }
+            ToolError::TimedOut(output) => write!(f, "command timed out\n\n{output}"),
+            ToolError::NonZeroExit(code, output) => {
+                write!(f, "command exited with code {code}\n\n{output}")
+            }
             ToolError::Io(err) => write!(f, "io error: {err}"),
         }
     }
@@ -139,6 +173,7 @@ pub enum Tool {
     WriteFile(WriteFile),
     EditFile(EditFile),
     Search(Search),
+    Exec(Exec),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +198,11 @@ pub struct EditFile {
     pub path: String,
     pub old: String,
     pub new: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exec {
+    pub command: String,
 }
 
 impl Tool {
@@ -235,6 +275,21 @@ impl Tool {
                     new: new.to_string(),
                 }))
             }
+            "exec" => {
+                let command = arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "exec requires a non-empty string argument `command`".to_string(),
+                        )
+                    })?;
+                Ok(Tool::Exec(Exec {
+                    command: command.to_string(),
+                }))
+            }
             "search" => {
                 let query = arguments
                     .get("query")
@@ -258,14 +313,8 @@ impl Tool {
         }
     }
 
-    /// 在当前工作目录下执行工具。
-    pub fn execute(&self) -> Result<String, ToolError> {
-        let root = std::env::current_dir().map_err(ToolError::Io)?;
-        self.execute_in(&root)
-    }
-
-    /// 在指定根目录下执行（便于测试）。
-    fn execute_in(&self, root: &Path) -> Result<String, ToolError> {
+    /// 在指定根目录下执行（便于测试与 Agent 注入 root）。
+    pub(crate) fn execute_in(&self, root: &Path) -> Result<String, ToolError> {
         match self {
             Tool::ReadFile(read_file) => read_file_within(root, &read_file.path),
             Tool::WriteFile(write_file) => {
@@ -275,6 +324,7 @@ impl Tool {
             Tool::EditFile(edit_file) => {
                 edit_file_within(root, &edit_file.path, &edit_file.old, &edit_file.new)
             }
+            Tool::Exec(exec) => exec_within(root, &exec.command),
         }
     }
 }
@@ -330,6 +380,155 @@ fn edit_file_within(root: &Path, path: &str, old: &str, new: &str) -> Result<Str
     let replaced = content.replacen(old, new, 1);
     fs::write(&resolved, replaced).map_err(ToolError::Io)?;
     Ok(format!("edited {path} successfully"))
+}
+
+/// 结构化的允许命令：可执行文件 + 白名单参数。
+///
+/// 由 [`ExecCommand::parse`] 从字符串解析得到，绝不包含 shell 元字符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecCommand {
+    /// 可执行文件名（如 `cargo`），不带路径。
+    program: String,
+    args: Vec<String>,
+}
+
+impl ExecCommand {
+    /// 解析命令字符串，并对解析结果做参数级白名单校验。
+    ///
+    /// 支持两种形式：
+    /// - `cargo <subcommand> [<args>...]`（白名单内）
+    /// - 单个白名单命令（如 `git status`），第一版为空集
+    ///
+    /// 整个字符串按空白拆分（不支持引号，引号属于非法参数），
+    /// 因此 `;`、`&&`、`|`、`>`、`$()` 等 shell 拼接无法混入。
+    fn parse(command: &str) -> Result<Self, ToolError> {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Err(ToolError::CommandNotAllowed(command.to_string()));
+        }
+
+        match tokens[0] {
+            "cargo" => {
+                let Some(sub) = tokens.get(1) else {
+                    return Err(ToolError::CommandNotAllowed(command.to_string()));
+                };
+                let args: Vec<String> = tokens[2..]
+                    .iter()
+                    .map(|t| {
+                        let s = t.to_string();
+                        if is_valid_arg(&s) {
+                            Ok(s)
+                        } else {
+                            Err(ToolError::CommandNotAllowed(s))
+                        }
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                let allowed = match *sub {
+                    "check" | "build" | "test" | "clippy" => true,
+                    "fmt" => args == ["--check"],
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(ToolError::CommandNotAllowed(command.to_string()));
+                }
+
+                Ok(ExecCommand {
+                    program: "cargo".to_string(),
+                    args: std::iter::once(sub.to_string())
+                        .chain(args)
+                        .collect(),
+                })
+            }
+            other => Err(ToolError::CommandNotAllowed(other.to_string())),
+        }
+    }
+}
+
+/// 允许出现在参数中的字符：字母、数字、`-`、`_`、`.`、`/`、`=`、`:`、`+`、`#`。
+///
+/// 排除空格（本身按空白拆分）、引号、`;`、`&`、`|`、`>`、`<`、`$`、\`、`*` 等
+/// 所有 shell 元字符，使命令无法拼接或重定向。
+fn is_valid_arg(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | '+' | '#' | ',')
+        })
+}
+
+/// 在 `root` 内执行允许的开发命令，返回 `exit code` + stdout + stderr。
+///
+/// 安全约束：
+/// - 只允许 `cargo check/build/test/clippy/fmt --check`（白名单，见 [`ExecCommand::parse`]）
+/// - 不使用 shell；通过 [`std::process::Command`] 直接传可执行文件与参数
+/// - 工作目录固定为 `root`，继承当前环境变量（模型无法修改）
+/// - 60 秒超时，超时返回已捕获的输出
+fn exec_within(root: &Path, command: &str) -> Result<String, ToolError> {
+    let parsed = ExecCommand::parse(command)?;
+
+    let mut child = Command::new(&parsed.program)
+        .args(&parsed.args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ToolError::Io)?;
+
+    // 先接管 stdout/stderr，避免子进程输出写满管道时阻塞
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > EXEC_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let output = collect_output(stdout, stderr);
+                    return Err(ToolError::TimedOut(output));
+                }
+                std::thread::sleep(EXEC_POLL_INTERVAL);
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ToolError::Io(err));
+            }
+        }
+    };
+
+    // 等子进程退出后再统一读取，输出量小不会死锁
+    let output = collect_output(stdout, stderr);
+
+    let code = status.code().unwrap_or(-1);
+    if status.success() {
+        Ok(format!("exit code: {code}\n\nstdout:\n{output}\nstderr:\n"))
+    } else {
+        Err(ToolError::NonZeroExit(code, output))
+    }
+}
+
+/// 依次读取 stdout 与 stderr 管道（子进程已退出，不会阻塞）。
+fn collect_output(mut stdout: ChildStdout, mut stderr: ChildStderr) -> String {
+    let mut out = String::new();
+    let mut err = String::new();
+    let _ = stdout.read_to_string(&mut out);
+    let _ = stderr.read_to_string(&mut err);
+
+    let mut output = String::new();
+    if !out.is_empty() {
+        output.push_str(&out);
+    }
+    if !err.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&err);
+    }
+    output
 }
 
 /// 校验路径是否位于 `root` 之内，并返回 canonicalized 后的路径。
@@ -1241,5 +1440,336 @@ mod tests {
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"search"));
         assert!(names.contains(&"edit_file"));
+    }
+
+    // ---------------- exec：参数解析 ---------------
+
+    #[test]
+    fn exec_parse_allows_plain_cargo_subcommands() {
+        for sub in ["check", "test", "build", "clippy"] {
+            let cmd = ExecCommand::parse(&format!("cargo {sub}")).unwrap();
+            assert_eq!(cmd.program, "cargo");
+            assert_eq!(cmd.args, vec![sub]);
+        }
+    }
+
+    #[test]
+    fn exec_parse_allows_fmt_check_only() {
+        let cmd = ExecCommand::parse("cargo fmt --check").unwrap();
+        assert_eq!(cmd.program, "cargo");
+        assert_eq!(cmd.args, vec!["fmt", "--check"]);
+    }
+
+    #[test]
+    fn exec_parse_rejects_fmt_without_check() {
+        assert!(matches!(
+            ExecCommand::parse("cargo fmt"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parse_rejects_fmt_with_extra_args() {
+        assert!(matches!(
+            ExecCommand::parse("cargo fmt --check --verbose"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parse_rejects_unknown_cargo_subcommand() {
+        assert!(matches!(
+            ExecCommand::parse("cargo run"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+        assert!(matches!(
+            ExecCommand::parse("cargo publish"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+        assert!(matches!(
+            ExecCommand::parse("cargo doc"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parse_rejects_cargo_without_subcommand() {
+        assert!(matches!(
+            ExecCommand::parse("cargo"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parse_rejects_shell_metacharacters() {
+        for command in [
+            "cargo check; rm -rf .",
+            "cargo check && touch x",
+            "cargo check | grep error",
+            "cargo check > /dev/null",
+            "cargo check 2>&1",
+            "cargo check $(date)",
+            "cargo check `id`",
+            "cargo check --target 'x86_64'",
+            "cargo check '--foo'",
+            "cargo check --features \"a b\"",
+            "sh -c 'cargo check'",
+            "bash -c 'cargo check'",
+        ] {
+            assert!(
+                matches!(
+                    ExecCommand::parse(command),
+                    Err(ToolError::CommandNotAllowed(_))
+                ),
+                "should reject: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_parse_rejects_unknown_programs() {
+        for command in [
+            "rm", "cat", "grep", "ls", "bash", "sh", "zsh", "python", "curl", "git",
+        ] {
+            assert!(
+                matches!(
+                    ExecCommand::parse(command),
+                    Err(ToolError::CommandNotAllowed(_))
+                ),
+                "should reject: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_parse_rejects_unknown_program_with_args() {
+        assert!(matches!(
+            ExecCommand::parse("rm -rf ."),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+        assert!(matches!(
+            ExecCommand::parse("cat Cargo.toml"),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_parse_allows_known_cargo_flags() {
+        for command in [
+            "cargo check --quiet",
+            "cargo check --all-targets",
+            "cargo check --all-features",
+            "cargo check --no-default-features",
+            "cargo check --manifest-path=Cargo.toml",
+            "cargo check --lib",
+            "cargo check --bins",
+            "cargo check --tests",
+            "cargo check --benches",
+            "cargo check --examples",
+            "cargo test -- --nocapture",
+            "cargo clippy --all-targets",
+            "cargo build --release",
+            "cargo build --features foo",
+            "cargo build --features foo,bar",
+            "cargo build --target x86_64-apple-darwin",
+            "cargo build --jobs 4",
+            "cargo build --color always",
+            "cargo build --offline",
+            "cargo check --offline",
+            "cargo test --offline",
+            "cargo clippy --offline",
+        ] {
+            ExecCommand::parse(command).unwrap_or_else(|e| panic!("should allow: {command} ({e})"));
+        }
+    }
+
+    #[test]
+    fn exec_from_call_parses_command() {
+        let args = serde_json::json!({ "command": "cargo check" });
+        let tool = Tool::from_call("exec", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::Exec(Exec {
+                command: "cargo check".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn exec_from_call_rejects_missing_command() {
+        let args = serde_json::json!({});
+        assert!(matches!(
+            Tool::from_call("exec", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn exec_from_call_rejects_empty_command() {
+        let args = serde_json::json!({ "command": "   " });
+        assert!(matches!(
+            Tool::from_call("exec", &args),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn exec_from_call_does_not_trim_internal_spaces() {
+        let args = serde_json::json!({ "command": "cargo  check" });
+        let tool = Tool::from_call("exec", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::Exec(Exec {
+                command: "cargo  check".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn exec_all_definitions_schema() {
+        let defs = all_definitions();
+        let exec = defs
+            .iter()
+            .find(|d| d.name == "exec")
+            .unwrap();
+
+        assert_eq!(exec.name, "exec");
+        assert!(
+            exec.description
+                .contains("allowed project development command")
+        );
+        assert_eq!(exec.parameters["type"], "object");
+        assert_eq!(exec.parameters["properties"]["command"]["type"], "string");
+        assert_eq!(exec.parameters["required"], serde_json::json!(["command"]));
+    }
+
+    #[test]
+    fn exec_all_definitions_keeps_existing_tools() {
+        let defs = all_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"exec"));
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static EXEC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// 每个测试一个独立的最小 Cargo 工程目录，避免并行测试互相干扰。
+    fn temp_cargo_root() -> PathBuf {
+        let n = EXEC_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("myagent-exec-test-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"myagent-exec-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn exec_parse_echoes_back_error_for_unknown_command() {
+        // 通过 Tool::from_call 走完整链路：命令进入工具后应被白名单拒绝
+        let args = serde_json::json!({ "command": "echo hello" });
+        let tool = Tool::from_call("exec", &args).unwrap();
+        assert!(matches!(
+            tool.execute_in(Path::new(".")),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn exec_cargo_test_passes_in_fixture() {
+        let root = temp_cargo_root();
+        let tool = Tool::Exec(Exec {
+            command: "cargo test --offline".to_string(),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("exit code: 0"), "unexpected: {result}");
+        assert!(result.contains("test result: ok"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn exec_cargo_build_passes_in_fixture() {
+        let root = temp_cargo_root();
+        let tool = Tool::Exec(Exec {
+            command: "cargo build --offline".to_string(),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("exit code: 0"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn exec_cargo_clippy_passes_in_fixture() {
+        let root = temp_cargo_root();
+        let tool = Tool::Exec(Exec {
+            command: "cargo clippy --offline".to_string(),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(result.contains("exit code: 0"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn exec_failing_command_reports_errors_and_output() {
+        let root = temp_cargo_root();
+        fs::write(root.join("src/main.rs"), "fn main() { let x = ; }\n").unwrap();
+
+        let tool = Tool::Exec(Exec {
+            command: "cargo check --offline".to_string(),
+        });
+        match tool.execute_in(&root) {
+            Err(ToolError::NonZeroExit(code, output)) => {
+                assert_ne!(code, 0);
+                assert!(
+                    output.contains("expected expression"),
+                    "unexpected: {output}"
+                );
+            }
+            other => panic!("expected NonZeroExit, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_working_directory_is_root() {
+        let root = temp_cargo_root();
+        let tool = Tool::Exec(Exec {
+            command: "cargo check --offline".to_string(),
+        });
+        let result = tool.execute_in(&root).unwrap();
+        assert!(
+            result.contains("myagent-exec-fixture"),
+            "unexpected: {result}"
+        );
+    }
+
+    #[test]
+    fn exec_stderr_is_captured() {
+        let root = temp_cargo_root();
+        fs::write(root.join("src/main.rs"), "fn main() { let x = ; }\n").unwrap();
+
+        let tool = Tool::Exec(Exec {
+            command: "cargo check --offline".to_string(),
+        });
+        match tool.execute_in(&root) {
+            Err(ToolError::NonZeroExit(_, output)) => {
+                // cargo 将编译错误写到 stderr，应出现在结果里
+                assert!(
+                    output.contains("expected expression"),
+                    "unexpected: {output}"
+                );
+            }
+            other => panic!("expected NonZeroExit, got: {other:?}"),
+        }
     }
 }
