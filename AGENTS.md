@@ -1,223 +1,367 @@
 # AGENTS.md
 
-# AGENTS.md
-
 ## Project
 
-This project is a minimal AI coding agent written from scratch in Rust.
+这是一个从零使用 Rust 构建 AI Agent Runtime 的实验项目。
 
-The long-term goal is to build a **Nix-native Agent Runtime** rather than simply clone an existing coding agent.
+它不是 Pi / OpenCode / Claude Code 的复制品，而是在探索：
 
-The project is intentionally built from first principles.
+```text
+Agent
++
+Typed Tools
++
+Runtime
++
+Nix
+```
 
-## Core Principles
+项目从第一性原理出发，优先设计更清晰的原语，而不是照搬现有 Agent 的行为。
 
-### 1. Keep the core small
+## Architecture
 
-Do not add features unless they are required by the current task.
+当前核心架构：
 
-Prefer a small, understandable implementation over a feature-rich framework.
+```text
+CLI
+ ↓
+Agent Loop
+ ↓
+Model
+ ↓
+Tool
+ ↓
+Tool Result
+ ↓
+Model
+ ↓
+Final Response
+```
 
-### 2. Agent Core must be independent of the runtime
+当前代码位置：
 
-The architecture should separate:
+```text
+src/main.rs      CLI 与 Agent Loop
+src/message.rs   conversation message 类型（Role / Message / ToolCall）
+src/model.rs     Model trait + OpenAI-compatible provider
+src/tool.rs      Tool 抽象 + read_file + 路径边界校验
+```
+
+核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦：
+
+```text
+Model → Response::ToolCall → Agent → Tool → Filesystem
+```
+
+## Principles
+
+1. **Keep the core small** — 只实现当前任务需要的功能。
+2. **Prefer typed tools over shell commands** — 文件操作是 typed tool，不是 shell 命令。
+3. **Keep Model independent from Tool execution** — Model 只表达意图，不直接执行文件操作。
+4. **Keep Tool execution independent from Model provider** — provider 不触碰文件系统。
+5. **Avoid premature abstractions** — 不为"以后可能有用"而加抽象。
+6. **Prefer standard library where practical** — 能用 std 解决就不用新 crate。
+7. **Make the smallest change necessary** — 不重写能正常工作的代码。
+
+## Incremental Development Workflow
+
+项目采用**增量式开发（incremental development）**。
+
+每实现一个独立功能，都必须立即进行验证。
+
+### 1. 每个功能完成后必须运行 `cargo check`
+
+每完成一个功能、一个明确的开发任务或一个逻辑单元后，必须运行：
+
+```bash
+cargo check
+```
+
+如果 `cargo check` 出现编译错误：
+
+- 不要把错误交给用户处理
+- AI 必须自己分析错误原因
+- AI 必须自己修改代码
+- 再次运行 `cargo check`
+- 重复这个过程，直到 `cargo check` 成功
+
+流程：
+
+```text
+Implement
+    ↓
+cargo check
+    ↓
+Error?
+ ┌──┴──┐
+Yes    No
+ │      │
+ ▼      ▼
+Fix    Continue
+ │
+ └──→ cargo check
+```
+
+不要在代码无法通过 `cargo check` 的情况下宣称当前功能完成。
+
+### 2. 功能完成后必须进行自我检查
+
+当一个功能实现并通过 `cargo check` 后，AI 应该检查：
+
+- 当前功能是否真正满足任务要求
+- 是否引入了不必要的复杂度
+- 是否破坏已有功能
+- 是否存在明显的错误处理问题
+- 是否需要测试
+- 当前架构是否仍然清晰
+
+根据检查结果，必要时自行修复问题。
+
+### 3. AI 必须主动规划下一步
+
+完成当前功能后，AI 应该根据：
+
+- 当前代码状态
+- 项目架构
+- README.md
+- AGENTS.md
+- 当前 roadmap
+- 已经实现的功能
+
+自行判断：
+
+> **下一步最合理应该实现什么？**
+
+AI 应该向用户提出一个明确的下一步建议，而不是直接开始实现。
+
+例如：
+
+```text
+Current feature: read_file
+
+Suggested next step:
+Implement write_file because it complements the existing
+read_file capability and is the next minimal filesystem tool.
+
+Reason:
+...
+```
+
+### 4. 下一步必须获得用户明确同意
+
+AI 可以：
+
+- 分析下一步
+- 提出建议
+- 解释为什么这是合理的下一步
+- 提供 1～3 个候选方向
+
+但是：
+
+> **未经用户明确同意，不得开始实现下一步功能。**
+
+也就是说：
+
+```text
+Implement current feature
+        ↓
+cargo check
+        ↓
+Self-review
+        ↓
+Determine next step
+        ↓
+Present proposal to user
+        ↓
+WAIT FOR USER APPROVAL
+        ↓
+User approves
+        ↓
+Implement next feature
+```
+
+绝对不要：
+
+```text
+完成 A
+ ↓
+自动实现 B
+ ↓
+自动实现 C
+ ↓
+自动实现 D
+```
+
+### 5. 用户拥有最终开发决策权
+
+AI 是：
+
+```text
+Developer + Architect Assistant
+```
+
+而不是：
+
+```text
+Autonomous Developer
+```
+
+AI 可以主动思考和提出方案，但最终的：
+
+- 功能选择
+- 架构方向
+- Roadmap 顺序
+- 是否继续开发
+
+必须由用户决定。
+
+### 6. 不要因为“下一步很明显”而跳过确认
+
+即使 AI 认为某个功能是显而易见的下一步，也必须等待用户确认。
+
+例如：
+
+```text
+AI:
+read_file 已完成。
+
+我建议下一步实现 write_file，因为它与 read_file
+组成最基本的 filesystem tool pair。
+
+是否继续实现 write_file？
+```
+
+只有用户明确同意后才能继续。
+
+### 7. 单次任务边界
+
+一次用户授权只代表：
+
+> **实现用户明确授权的当前功能。**
+
+完成后必须停止，并重新提出下一步建议。
+
+不要把用户的一次：
+
+```text
+“实现 read_file”
+```
+
+理解成：
+
+```text
+“把整个 Tool 系统都实现了”
+```
+
+### 8. Verification Hierarchy
+
+最基本的验证要求：
+
+```bash
+cargo check
+```
+
+如果当前任务适合测试，则进一步运行：
+
+```bash
+cargo test
+```
+
+如果当前任务适合完整质量检查，则运行：
+
+```bash
+cargo fmt --check
+cargo clippy
+```
+
+但无论如何：
+
+> 每完成一个功能，至少必须成功通过 `cargo check`。
+
+### 9. Completion Report
+
+完成一个功能后，向用户报告：
+
+```text
+Implemented:
+- ...
+
+Verification:
+- cargo check: passed
+- cargo test: passed / not required
+- cargo clippy: passed / not required
+
+Self-review:
+- ...
+
+Suggested next step:
+- ...
+
+Reason:
+- ...
+
+Waiting for approval.
+```
+
+报告完成后停止，不继续实现建议中的下一步。
+
+## Current Scope
+
+当前只实现：
 
 ```text
 Model
-  ↓
-Agent Core
-  ↓
-Tools
-  ↓
-Runtime
-  ↓
-Operating System
+Conversation
+Agent Loop
+Tool Calling
+read_file
 ```
 
-The Agent Core must not directly depend on:
+不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。
 
-- `std::process::Command`
-- shell commands
-- Nix
-- macOS-specific APIs
-- Linux-specific APIs
+## Important Restrictions
 
-These belong in the Runtime layer.
+除非任务明确要求，否则不要：
 
-### 3. Tools are typed capabilities
-
-Tools should be explicit and strongly typed.
-
-Prefer:
-
-```rust
-enum Tool {
-    Read(Read),
-    Write(Write),
-    Search(Search),
-    Exec(Exec),
-}
-```
-
-Avoid exposing an unrestricted shell as the primary interface.
-
-The goal is to eventually model tools as capabilities that the Runtime can restrict.
-
-### 4. Runtime abstraction
-
-The Agent should interact with the outside world through a Runtime abstraction.
-
-The initial implementation may use:
-
-```text
-LocalRuntime
-```
-
-Later implementations may include:
-
-```text
-NixRuntime
-SandboxRuntime
-VMRuntime
-```
-
-Do not couple the Agent Core to any specific Runtime implementation.
-
-### 5. Nix is part of the long-term architecture
-
-Nix is not merely a package manager for this project.
-
-The long-term goal is to use Nix to describe and provide:
-
-- dependencies
-- development environments
-- execution environments
-- reproducibility
-- capabilities
-- sandbox boundaries
-
-However, **do not introduce Nix-specific complexity before the basic Agent works.**
-
-The first working implementation should be able to run with `LocalRuntime`.
-
-## Development Order
-
-Follow this order unless there is a strong reason not to:
-
-1. LLM provider abstraction
-2. Messages
-3. Agent loop
-4. Tool abstraction
-5. `read`
-6. `write`
-7. `search`
-8. `exec`
-9. `LocalRuntime`
-10. `NixRuntime`
-11. capabilities
-12. sandboxing
-13. sessions
-14. subagents
-
-Do not implement later stages prematurely.
-
-## Rust Guidelines
-
-Prefer:
-
-- small structs
-- enums for finite states
-- traits for stable boundaries
-- explicit error types
-- `Result` instead of panics
-- immutable data where practical
-- simple async code
-
-Avoid introducing large frameworks unless they solve a demonstrated problem.
-
-Do not create abstractions merely because they might be useful later.
-
-## Dependencies
-
-Keep dependencies minimal.
-
-Before adding a crate, ask:
-
-1. Is it actually necessary?
-2. Can the standard library solve this cleanly?
-3. Does it introduce a large abstraction for a small problem?
-4. Does it make the architecture harder to understand?
-
-Prefer mature, small dependencies.
-
-## Testing
-
-Every new core behavior should have a test.
-
-Prioritize testing:
-
-- Agent state transitions
-- tool parsing
-- tool execution
-- runtime behavior
-- error handling
-
-Tests should not require an external LLM unless the test specifically verifies model integration.
-
-Prefer deterministic tests.
+- 添加新的 Tool
+- 添加 shell / exec
+- 添加 write / edit
+- 添加 MCP
+- 添加 subagents
+- 添加 session persistence
+- 添加 sandbox
+- 添加 Nix Runtime
+- 大规模重构
+- 更换 Model provider
+- 添加新依赖（除非当前代码确实缺少）
 
 ## Nix
 
-The project uses Nix Flakes for the development environment.
-
-Use:
-
-```bash
-nix develop
-```
-
-to enter the development environment.
-
-Do not install project dependencies globally.
-
-The project should eventually be reproducible from its Nix configuration.
-
-## CLI
-
-The CLI should remain simple.
-
-Prefer:
+Nix 当前仅用于：
 
 ```text
-mypi
+Development Environment
 ```
 
-for interactive mode and:
+即 `nix develop` 提供的 Rust 工具链，**不是** Runtime。
+
+未来才会探索：
 
 ```text
-mypi "task"
+Nix
+ ↓
+Runtime
+ ↓
+Capabilities
+ ↓
+Sandbox
 ```
 
-for one-shot tasks.
+没有明确任务时不要提前实现这些。
 
-Do not add CLI options unless they correspond to an actual feature.
+## Verification
 
-## Agent Behavior
-
-When working on a task:
-
-1. Inspect the existing code.
-2. Understand the current architecture.
-3. Make the smallest change that solves the task.
-4. Run relevant tests.
-5. Run formatting and static checks.
-6. Do not refactor unrelated code.
-
-Do not rewrite working code merely to make it look different.
-
-## Commands
-
-Before considering a change complete, run the appropriate checks:
+任何代码修改完成后至少运行：
 
 ```bash
 cargo fmt --check
@@ -226,53 +370,10 @@ cargo test
 cargo clippy
 ```
 
-When Nix integration exists, also verify the relevant Nix commands.
+如果修改涉及实际 Agent 行为（Agent Loop、Tool、Model 交互），应进行一次手动测试。
 
-## Important Constraint
+## Documentation Rule
 
-This project is an experiment in designing an Agent Runtime.
+README.md 和 AGENTS.md 必须与实际代码保持一致。
 
-Do not optimize for feature parity with Pi, OpenCode, Claude Code, or other existing agents.
-
-When choosing between:
-
-```text
-"copy an existing Agent's behavior"
-```
-
-and:
-
-```text
-"design a cleaner primitive"
-```
-
-prefer the cleaner primitive when it does not unnecessarily complicate the implementation.
-
-## Current Goal
-
-The immediate goal is deliberately small:
-
-```text
-LLM
- ↓
-Agent Loop
- ↓
-read / write / search / exec
- ↓
-LocalRuntime
-```
-
-Get this working before implementing Nix-specific runtime features.
-
-## Tool Usage
-
-- **Search:** Use Pi's built-in `grep` / `find` tools. For multiple OR patterns, use `multi_grep` in a single call. If Bash search is unavoidable, use `rg`, never `grep`.
-- **Read:** After locating a file or match, use `read` with `offset` / `limit` to inspect only the relevant region. For known files outside the workspace, use `read` directly.
-
-### Context Discipline
-
-- Prefer bounded, structured tool output over raw shell output.
-- Do not use recursive `grep` / `find` through the workspace.
-- Do not dump entire files when only a relevant section is needed.
-- Avoid commands whose output can grow with repository size.
-- Treat context as a limited resource: retrieve only what is necessary to make the next decision.
+如果代码架构发生变化，应同步更新相关文档。
