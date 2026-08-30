@@ -1,14 +1,24 @@
 mod agent;
 mod message;
 mod model;
+mod session;
 mod tool;
 
 use crate::agent::Agent;
 use crate::model::OpenAICompatibleModel;
+use crate::session::Session;
 use message::Message;
 
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+
+/// 默认会话文件路径；可用 `MYAGENT_SESSION` 环境变量覆盖。
+fn session_path() -> PathBuf {
+    env::var("MYAGENT_SESSION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("session.json"))
+}
 
 fn main() {
     let api_key = match env::var("OPENAI_API_KEY") {
@@ -28,8 +38,15 @@ fn main() {
         }
     };
 
-    // 完整对话历史，每轮都会带着之前的所有消息重新请求
-    let mut conversation: Vec<Message> = Vec::new();
+    // 启动时恢复已有 conversation（文件不存在则从空对话开始）
+    let path = session_path();
+    let mut conversation = match Session::load(&path) {
+        Ok(conversation) => conversation,
+        Err(err) => {
+            eprintln!("failed to load session: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let stdin = io::stdin();
     let mut input = stdin.lock().lines();
@@ -63,6 +80,10 @@ fn main() {
                 }) = conversation.last()
                 {
                     println!("AI: {content}");
+                }
+                // 每轮成功完成后保存；Model error 时 run_turn 已回滚，不保存半成品
+                if let Err(err) = Session::save(&path, &conversation) {
+                    eprintln!("failed to save session: {err}");
                 }
             }
             Err(err) => eprintln!("error: {err}"),
