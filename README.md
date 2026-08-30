@@ -30,6 +30,7 @@ Nix
 - [x] `search` 工具
 - [x] `edit_file` 工具（精确文本替换）
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
+- [x] Session persistence（conversation 保存/恢复，单 session）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
 - [x] Nix Flake 开发环境
@@ -41,7 +42,6 @@ Nix
 - [ ] Capability system
 - [ ] MCP
 - [ ] subagents
-- [ ] session persistence
 
 ## Architecture
 
@@ -71,7 +71,8 @@ Final Response
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
 | `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验 |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
-| `src/main.rs` | CLI entrypoint：读入用户输入，创建 Model / Agent，显示结果 |
+| `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
+| `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入，创建 Model / Agent，显示结果 |
 
 ### 依赖方向
 
@@ -117,6 +118,12 @@ You: /exit
 
 退出方式：输入 `/exit`，或按 `Ctrl-D`（EOF）。
 
+对话会自动保存到 `session.json`（可用 `MYAGENT_SESSION` 环境变量指定路径）：
+
+- 启动时自动加载已有 conversation（文件不存在则从空对话开始）
+- 每轮成功完成后保存
+- 当前只支持单 session 的保存/恢复，不是完整的 session management
+
 ## Development
 
 进入 Nix 开发环境后，运行检查：
@@ -128,7 +135,7 @@ cargo test
 cargo clippy
 ```
 
-测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `edit_file` / `exec` 的工具执行，以及 Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限）。测试不依赖外部 LLM。
+测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `edit_file` / `exec` 的工具执行，Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限），session 的 save→load round-trip（含空/多轮/带 ToolCall 的 conversation）与损坏文件错误处理，以及 `OpenAICompatibleModel` ↔ Agent 的 mock-HTTP 集成测试（验证真实 provider 的请求序列化、ToolCall → 工具执行 → Tool Result 回传、API 错误传播，不依赖外部 LLM）。
 
 ## 关于 `exec` 的边界
 

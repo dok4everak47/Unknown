@@ -58,6 +58,14 @@ impl<M: Model> Agent<M> {
         Ok(Self { model, root })
     }
 
+    /// 测试辅助（仅测试构建）：在指定根目录下创建 Agent。
+    ///
+    /// 供 model.rs 的集成测试用 mock server 驱动真实 `OpenAICompatibleModel`。
+    #[cfg(test)]
+    pub(crate) fn new_with_root_for_test(model: M, root: PathBuf) -> Self {
+        Self { model, root }
+    }
+
     /// 处理一次用户输入：可能触发多轮 model ↔ tool 交互，
     /// 直到模型给出文本回答。
     ///

@@ -41,11 +41,12 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent）
+src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent、加载/保存 session）
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、可注入 fake Model 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
 src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验
+src/session.rs   conversation 持久化（Session::load / Session::save）
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦：
@@ -379,6 +380,7 @@ write_file
 search
 edit_file
 exec（受控开发命令，白名单）
+session persistence（单 session 保存/恢复）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。
