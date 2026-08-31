@@ -1,5 +1,6 @@
 mod agent;
 mod capabilities;
+mod config;
 mod message;
 mod model;
 mod nix_runtime;
@@ -62,6 +63,11 @@ fn read_only_mode() -> bool {
 }
 
 fn main() {
+    // 先加载 .env（工作目录）；真实环境变量优先，.env 仅兜底。
+    if let Err(err) = config::load_dotenv(std::path::Path::new(".env")) {
+        eprintln!("warning: failed to read .env: {err}");
+    }
+
     let api_key = match env::var("OPENAI_API_KEY") {
         Ok(key) => key,
         Err(_) => {

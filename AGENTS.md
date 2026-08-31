@@ -41,7 +41,8 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent、选择 Runtime、加载/保存 session）
+src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session）
+src/config.rs    .env 配置加载（KEY=VALUE；环境变量优先于 .env；纯 std 解析）
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
@@ -462,6 +463,7 @@ session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
 Capability-based execution（Capabilities 权限门，MYAGENT_READ_ONLY=1/true 只读模式）
+.env 配置文件（工作目录 .env 自动加载，环境变量优先；模板见 .env.example）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。

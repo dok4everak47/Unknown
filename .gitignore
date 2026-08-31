@@ -16,3 +16,5 @@ target/
 
 # pi harness session state (todos etc.)
 .pi/
+# session persistence artifact
+session.json

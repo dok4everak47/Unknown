@@ -107,15 +107,27 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 nix develop
 ```
 
-配置模型 API（使用 OpenAI-compatible 接口，本项目用 DeepSeek 做过验证）：
+配置模型 API（使用 OpenAI-compatible 接口，本项目用 DeepSeek 做过验证）。
+推荐方式：复制 `.env.example` 为 `.env` 并填入配置，程序启动时自动从工作目录
+的 `.env` 加载（`KEY=VALUE`，`#` 注释，支持引号）：
 
 ```bash
-export OPENAI_API_KEY="..."         # 必填
-export OPENAI_BASE_URL="..."        # 可选，默认 https://api.openai.com/v1
-export OPENAI_MODEL="..."           # 可选，默认 gpt-4o-mini
+cp .env.example .env
+# 编辑 .env：
+#   OPENAI_API_KEY=...          # 必填
+#   OPENAI_BASE_URL=...         # 可选，默认 https://api.openai.com/v1
+#   OPENAI_MODEL=...            # 可选，默认 gpt-4o-mini
 ```
 
-> 环境变量默认值见 `OpenAICompatibleModel::new`（`src/model.rs`）。项目根目录的 `.env` 不会被程序自动加载，需手动 `export` 或 `set -a && . ./.env && set +a` 注入。
+`.env` 含密钥，已被 `.gitignore` 忽略。优先级：**真实环境变量 > `.env` 文件 >
+代码默认值**（命令行临时注入会覆盖 `.env`）。也可以直接用环境变量：
+
+```bash
+export OPENAI_API_KEY="..."
+```
+
+> 环境变量默认值见 `OpenAICompatibleModel::new`（`src/model.rs`），加载逻辑见
+> `src/config.rs`。
 
 运行：
 
