@@ -1,10 +1,18 @@
 # Autoresearch Prompt: reduce release binary size
 
-- Status: **finalized 2026-08-31 — binary_kb 5852 → 1980 KB (-66.2%); review by Codex, merged via squash finalize**
+- Status: **ended 2026-08-31 (continuation) — binary_kb 5852 → 1980 KB (-66.2%) pre-feature; post-NixRuntime-feature floor 1996 KB; thread ended, no in-scope lever remains**
 - Created: 2026-08-31
 - Owner: Pi autoresearch
 - Reviewer: Codex
 - Primary metric: `binary_kb`（lower is better）
+
+> **结束原因（2026-08-31）**：在 Nix Runtime 功能落地后，对当前 tree 重新基准，
+> floor 为 **1996 KB**（功能本身仅 ~1.7 KB 真实代码；~14 KB 磁盘增量来自 Mach-O
+> 段对齐 + code-signature 页哈希，属固有开销）。所有 in-scope 杠杆在 42 个实验 +
+> finalize + 复基准中全部 A/B 验证耗尽。唯一剩余杠杆 `-Z build-std`（std 以
+> -Oz+abort 重编，约省数十 KB）被记录为 out-of-scope：环境无 nightly/rustup，
+> 需安装 nightly 工具链，且会使每次 cargo check/test/clippy 全量重编 std。
+> 已记入 `.auto/ideas.md`，需正常审批流程批准后再尝试。
 
 > 原目标 `check_seconds` 已在实验 #5 确认到达硬性下限（0.09-0.11s = cargo floor 0.04s + active-graph metadata scan 0.05s；对源码大小、fingerprint 数量、-j、incremental 均不变）。
 > 按本文件规定的切换流程，现改为优化 **release 二进制体积** `binary_kb`（`WORKLOAD=size .auto/measure.sh`）。

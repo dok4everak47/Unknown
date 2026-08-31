@@ -343,3 +343,56 @@ approval flow if binary size matters more than TLS provider choice.
   so relocated pointers are NOT locked read-only after dyld fixup.
 - Trade-off: 16 KB (0.8%) vs. standard macOS hardening (post-fixup read-only GOT).
   Decision: keep hardening; flag removed in finalize. Final binary: 1980 KB.
+
+## Post-NixRuntime feature directions (2026-08-31, feature task, normal approval flow)
+
+NixRuntime (2nd Runtime backend, MYAGENT_RUNTIME=local|nix) is implemented. Deferred
+next steps — NOT to be done in autoresearch (features, need approval):
+
+1. **RuntimeContext 配置化**（docs/runtime-design.md §5 条件 1）：timeout / env 可配
+   （当前两个实现硬编码 60s、继承 env）。测试可注入短 timeout 补 TimedOut 盲区。
+2. **Sandbox**（§5 条件 3 之外的防御层）：模型可信 + 白名单已是最小权限，当前无需求。
+3. **Capability system**（§5 条件 3）：read-only 模式 / 按 Agent 权限分化。
+4. **Container / remote executor**（§5 条件 2 延伸）：无当前需求。
+5. **exec 白名单扩展**（如 git、cargo expand）：有明确需求再议，需与 nix develop 语义配合。
+
+## Finding (2026-08-31) — test_seconds metric is BROKEN (not viable as a target)
+
+- `WORKLOAD=test .auto/measure.sh` ALWAYS reports `test_seconds=0.000`, regardless of the
+  real value (~1.5s: 107 tests pass in 1.36s + ~0.15s overhead).
+- Root cause (bash -x trace): `test_ms="$(time_ms cargo test --quiet)"` — `cargo test --quiet`
+  prints the test-harness output ("running 107 tests…", progress dots, "test result: ok…") to
+  STDOUT, which is captured by the command substitution. `test_ms` becomes the multi-line string
+  `"running 107 tests\n…\n1614"`. `ms_to_s "$test_ms"` passes it to perl, which coerces the
+  leading-non-numeric string to 0 → `0.000`.
+- By contrast `check` and `build` workloads are clean (cargo check/build print nothing to stdout),
+  which is why check_seconds / build_seconds / binary_kb parse correctly.
+- **test_seconds can never be measured correctly with the current measure.sh, and measure.sh is
+  OFF-LIMITS in autoresearch** → test time is NOT a viable target for this loop.
+- Fix (needs normal flow / user approval since measure.sh is off-limits): redirect the harness
+  output inside the test case, e.g. `test_ms="$(time_ms cargo test --quiet >/dev/null 2>&1)"`
+  (must be a one-line fix so only the ms echo is captured).
+
+## Finding (2026-08-31) — build-std DEFINTIVELY infeasible in this environment (live-tested, hypothesis falsified)
+
+- Motivating probe: exp #40 recorded build-std as "nightly-only, needs RUSTC_BOOTSTRAP hack, would
+  slow every cargo cmd". Live tests this session correct the record:
+  1. `-Z build-std=std` **IS accepted** on this stable cargo 1.98 with `RUSTC_BOOTSTRAP=1` — no
+     nightly/rustup install is needed (the old "nightly-only" blocker was wrong). Verified via a
+     safe probe: cargo proceeded past -Z parsing and failed only at a (deliberately nonexistent)
+     target lookup, i.e. the flag was honored.
+  2. The REAL blocker is environmental: the nix sysroot std source
+     (`/nix/store/…/rust-default-1.98.0/lib/rustlib/src/rust/library/std`) declares `wasip1` as an
+     external crates.io dependency. `wasip1` is NOT in the local cargo cache and NOT in Cargo.lock.
+  3. crates.io is unreachable from this environment (persistent SSL connect error
+     `0A000126:unexpected eof`, retried 3x per attempt across multiple attempts, online + offline
+     both fail: offline says "no matching package named wasip1 found").
+- **Conclusion: build-std cannot be executed here at all** — the std source tree cannot be
+  resolved without crates.io. The binary_kb lever is closed by environment, not by scope.
+  Even with user approval it would need: network/registry access OR vendoring std's deps
+  (wasip1, compiler_builtins, cc, …) — outside code scope.
+- Config was reverted (git checkout .cargo/config.toml); tree clean; binary_kb floor 1996 KB intact.
+- This was the LAST untested lever. The binary_kb thread is now exhaustively closed:
+  every in-scope dimension A/B-verified (opt=z, fat LTO, cgu=1, strip, panic=abort, outliner,
+  linker, features, C-flags, sections) + every out-of-scope path tested and blocked
+  (TLS swap = deps, async reqwest = arch, build-std = network).

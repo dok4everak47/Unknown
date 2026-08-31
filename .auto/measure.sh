@@ -42,10 +42,14 @@ ms_to_s() {
 }
 
 # Time a command in ms; echoes the duration. Stderr passes through.
+# The command's stdout is redirected to stderr: `cargo test --quiet` (unlike
+# check/build --quiet) leaks the test-harness output ("running N tests…") to
+# stdout, which would otherwise be captured by $(...) and coerced to 0 by
+# the ms->s conversion, making test_seconds always report 0.000.
 time_ms() {
   local start end
   start="$(now_ms)"
-  "$@"
+  "$@" >&2
   end="$(now_ms)"
   echo $((end - start))
 }
