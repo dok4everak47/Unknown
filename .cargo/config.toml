@@ -11,7 +11,23 @@
 #   It works by suppressing the __DATA_CONST segment, so __got/__const stay in
 #   a writable __DATA segment at runtime (no post-fixup read-only lockdown).
 #   Keeping the platform hardening feature is worth the 16 KB (0.8%).
+
+# Hide aws-lc (BoringSSL) C function visibility: the static lib's ~500 crypto
+# API symbols are currently exported in the LC_DYLD_EXPORTS_TRIE (17,912 B),
+# but nothing external links against this executable — they are dead metadata.
+# -fvisibility=hidden keeps them internally linkable (Rust FFI calls resolve
+# within the same image) while removing them from the export trie. Unlike
+# -no_exported_symbols (which broke proc-macro builds), this only touches the
+# aws-lc C compile. -Oz pinned so the C code stays size-optimized.
+[env]
+CFLAGS = "-Oz -fvisibility=hidden -flto"
+
 [target.aarch64-apple-darwin]
 rustflags = [
     "-C", "llvm-args=-enable-machine-outliner=always",
+    # Machine-outline the C code too: with CFLAGS=-flto the aws-lc BoringSSL
+    # codegen happens inside ld64's link-time LTO, which does NOT enable the
+    # machine outliner by default (same as -Oz clang, exp #21). Passing the
+    # LLVM option through ld64's -mllvm outlines the surviving C code as well.
+    "-C", "link-arg=-Wl,-mllvm,-enable-machine-outliner=always",
 ]
