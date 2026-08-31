@@ -366,6 +366,67 @@ AI 仍然必须遵守现有规则：
 
 > 完成当前功能后，可以根据 TODO 和项目状态提出下一步建议，但未经用户明确同意，不得实现下一步功能。
 
+## Autoresearch（pi-autoresearch 插件）
+
+本项目已安装 [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) 插件，用于**自主优化实验循环**：提出想法 → 测量 → 保留有效 / 回退无效 → 重复。
+
+它**不是**功能开发的替代流程，而是增量式开发之外的一个独立实验模式，**仅用于优化类目标**。
+
+### 何时使用
+
+- 只有用户显式发起时才进入该模式（`/skill:autoresearch-create` 或 `/autoresearch <text>`）。
+- 适合本项目的优化目标（metric 均为 **lower is better**）：
+  - `cargo build` 编译时间（秒）
+  - `cargo check` 检查时间（秒）
+  - `cargo test` 测试时间（秒）
+  - 二进制体积（KB，`du -sk target/release/myagent`）
+- 不适合：新功能、新工具、架构变更（这些仍走正常的审批流程）。
+
+### 会话结构
+
+所有会话文件放在工作目录根部的 `.auto/` 文件夹（该文件夹必须提交，且不会因实验回退而丢失）：
+
+| 文件 | 用途 |
+| --- | --- |
+| `.auto/prompt.md` | 会话文档：目标、metric、files in scope、off limits、已尝试内容（会话的心脏，续跑时据此恢复） |
+| `.auto/measure.sh` | 基准脚本，输出 `METRIC name=value` 行 |
+| `.auto/log.jsonl` | 每次实验的追加日志（由工具写入） |
+| `.auto/checks.sh` | 正确性检查（必需，见下方“本项目的硬约束”） |
+| `.auto/ideas.md` | 想法 backlog（可选） |
+| `.auto/hooks/` | 生命周期 hooks（可选，见 autoresearch-hooks skill） |
+
+启动流程：
+
+1. `git checkout -b autoresearch/<goal>-<date>`
+2. 阅读源码，深入理解工作负载后再动手
+3. 写入 `.auto/prompt.md` 与 `.auto/measure.sh` 并提交
+4. `init_experiment` → 跑 baseline → `log_experiment` → 开始循环
+
+### 本项目的硬约束
+
+自动优化实验同样必须遵守本文件的验证要求，在 `.auto/checks.sh` 中落实：
+
+```bash
+#!/bin/bash
+set -euo pipefail
+cargo fmt --check
+cargo check
+cargo test
+cargo clippy
+```
+
+- 任何实验改动不得破坏 `cargo fmt --check` / `cargo check` / `cargo test` / `cargo clippy`。checks 失败 → `checks_failed`，不得 `keep`。
+- 遵守 Principles：优先 std、不添加不必要依赖、只做最小改动。
+- 每个实验结果都用 `log_experiment` 的 `asi` 参数记录假设与教训（失败/回退的实验尤其要记录——代码被回退后，日志是唯一留存）。
+- 只对真正改进 primary metric 且通过 checks 的实验 `keep`；`discard` / `crash` 自动回退代码改动（`.auto/` 保留）。
+- 关注 confidence score：<1.0× 说明在噪声内，先复跑确认再决定是否 keep。
+
+### 与增量式开发规则的关系
+
+- autoresearch 只允许修改 `.auto/prompt.md` 中声明的 **Files in Scope** 内的代码。
+- 循环中发现的**新功能 / 新工具 / 架构方向**不得自行实现，应记入 `.auto/ideas.md`，退出循环后按正常审批流程提出。
+- 优化实验完成后用 `/skill:autoresearch-finalize` 整理成干净的、从 merge-base 出发的独立分支；合入前仍需通过完整验证（`cargo fmt --check` / `cargo check` / `cargo test` / `cargo clippy`）并更新 README TODO。
+
 ## Current Scope
 
 当前只实现：
