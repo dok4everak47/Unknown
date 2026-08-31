@@ -56,12 +56,24 @@ pub struct Agent<M: Model> {
 
 impl<M: Model> Agent<M> {
     /// 以当前工作目录作为工具执行根目录创建 Agent。
+    ///
+    /// 保留的公开便捷构造器（二进制 crate 内暂无外部调用方，故 allow dead_code）：
+    /// 委托 [`Agent::new_with_runtime`] + [`LocalRuntime`]。
+    #[allow(dead_code)]
     pub fn new(model: M) -> Result<Self, std::io::Error> {
+        Self::new_with_runtime(model, Box::new(LocalRuntime))
+    }
+
+    /// 以当前工作目录作为工具执行根目录、注入指定 Runtime 创建 Agent。
+    ///
+    /// 与 [`Agent::new`] 的区别：允许调用方选择副作用 Runtime，例如
+    /// [`NixRuntime`]（`src/nix_runtime.rs`）让 exec 在 nix devShell 中执行。
+    pub fn new_with_runtime(model: M, runtime: Box<dyn Runtime>) -> Result<Self, std::io::Error> {
         let root = std::env::current_dir()?;
         Ok(Self {
             model,
             root,
-            runtime: Box::new(LocalRuntime),
+            runtime,
         })
     }
 

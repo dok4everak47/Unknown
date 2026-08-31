@@ -52,7 +52,11 @@ pub enum ExecError {
 /// - [`Runtime::read_dir`] — 列目录条目（`fs::read_dir` + `file_type`）
 /// - [`Runtime::exec`] — 执行命令（`std::process::Command` 直调）
 ///
-/// 当前唯一实现是 [`LocalRuntime`]（直接操作真实文件系统与进程）；
+/// 当前实现：
+/// - [`LocalRuntime`] — std 直接操作真实文件系统与进程；
+/// - [`NixRuntime`]（src/nix_runtime.rs）— 文件操作委托本地，exec 经
+///   `nix develop --command` 落在可复现的 devShell 中执行。
+///
 /// 测试可注入 fake 实现，验证工具执行不触碰真实环境。
 pub trait Runtime {
     /// 读文件为 UTF-8 文本（对应 `fs::read_to_string`）。
@@ -105,44 +109,56 @@ impl Runtime for LocalRuntime {
     }
 
     fn exec(&self, program: &str, args: &[String], cwd: &Path) -> Result<ExecOutput, ExecError> {
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(ExecError::Io)?;
+        run_command(program, args, cwd)
+    }
+}
 
-        // 先接管 stdout/stderr，避免子进程输出写满管道时阻塞
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+/// 通用命令执行：spawn → 60s 超时轮询 → 合并 stdout/stderr → 退出码。
+///
+/// 被 [`LocalRuntime`] 与 [`NixRuntime`]（`nix develop --command` 包装）
+/// 共用，保证两个实现的超时、输出合并、退出码语义完全一致。
+pub(crate) fn run_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+) -> Result<ExecOutput, ExecError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ExecError::Io)?;
 
-        let start = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if start.elapsed() > EXEC_TIMEOUT {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let output = collect_output(stdout, stderr);
-                        return Err(ExecError::TimedOut(output));
-                    }
-                    std::thread::sleep(EXEC_POLL_INTERVAL);
-                }
-                Err(err) => {
+    // 先接管 stdout/stderr，避免子进程输出写满管道时阻塞
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > EXEC_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(ExecError::Io(err));
+                    let output = collect_output(stdout, stderr);
+                    return Err(ExecError::TimedOut(output));
                 }
+                std::thread::sleep(EXEC_POLL_INTERVAL);
             }
-        };
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ExecError::Io(err));
+            }
+        }
+    };
 
-        // 等子进程退出后再统一读取，输出量小不会死锁
-        let output = collect_output(stdout, stderr);
-        let code = status.code().unwrap_or(-1);
-        Ok(ExecOutput { code, output })
-    }
+    // 等子进程退出后再统一读取，输出量小不会死锁
+    let output = collect_output(stdout, stderr);
+    let code = status.code().unwrap_or(-1);
+    Ok(ExecOutput { code, output })
 }
 
 /// 依次读取 stdout 与 stderr 管道（子进程已退出，不会阻塞）。

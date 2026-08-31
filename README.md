@@ -14,7 +14,7 @@ Runtime
 Nix
 ```
 
-> ⚠️ 注意：`Nix Runtime` 目前**尚未实现**，只作为未来方向。`Runtime` 抽象（工具副作用原语）已实现，见下方代码结构。
+> ⚠️ 注意：`Sandbox` / `Capability system` 目前**尚未实现**，只作为未来方向。`Runtime` 抽象（工具副作用原语）与 `Nix Runtime` 已实现，见下方代码结构。
 
 ## 当前状态
 
@@ -31,6 +31,7 @@ Nix
 - [x] `edit_file` 工具（精确文本替换）
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
+- [x] Nix Runtime（`NixRuntime`：exec 经 `nix develop --command` 落在可复现 devShell）
 - [x] Session persistence（conversation 保存/恢复，单 session）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
@@ -38,7 +39,6 @@ Nix
 
 尚未实现：
 
-- [ ] Nix Runtime
 - [ ] Sandbox
 - [ ] Capability system
 - [ ] MCP
@@ -71,7 +71,8 @@ Final Response
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
 | `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
-| `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现） |
+| `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command` |
+| `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
 | `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入，创建 Model / Agent，显示结果 |
@@ -83,6 +84,12 @@ Final Response
 ```text
 Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 ```
+
+`Runtime` 有两个实现，CLI 用 `MYAGENT_RUNTIME` 环境变量选择：
+
+- `local`（默认）— `LocalRuntime`，std 直连文件系统与进程；
+- `nix` — `NixRuntime`，文件操作委托本地（nix 不虚拟化文件系统），exec 经
+  `nix develop --command` 在 flake.nix 声明的可复现 devShell 中执行（构造时验证 nix 可用）。
 
 ## Quick Start
 
@@ -105,7 +112,8 @@ export OPENAI_MODEL="..."           # 可选，默认 gpt-4o-mini
 运行：
 
 ```bash
-cargo run
+cargo run                 # 默认：exec 直接在当前环境执行（MYAGENT_RUNTIME=local）
+MYAGENT_RUNTIME=nix cargo run   # exec 经 `nix develop --command` 在 devShell 中执行
 ```
 
 示例对话：
@@ -150,6 +158,10 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 - 命令在项目工作目录内执行，继承当前环境变量，模型无法修改环境
 - 单次执行 60 秒超时；stdout / stderr / 退出码全部返回给模型
 
+当 `MYAGENT_RUNTIME=nix` 时，exec 会被包装为 `nix develop --command <cmd>`，在
+flake.nix 声明的可复现 devShell 中执行（文件操作仍走本地）。flake 的 `shellHook`
+横幅只在交互式 tty 下打印，不会污染 exec 工具的输出。
+
 它**不是** sandbox，也不代表完整 command execution。
 
 ## Roadmap
@@ -158,8 +170,6 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 
 ```text
 Tool system（扩展更多 typed tools）
-    ↓
-Nix Runtime
     ↓
 Capability-based execution
     ↓
@@ -174,3 +184,4 @@ Sandbox
 - sessions
 - MCP
 - subagents
+- 更精细的权限 / 沙箱（Capability system / Sandbox）

@@ -28,7 +28,11 @@
         # 关闭 rust-analyzer 内部 telemetry（减少 IPC 抖动）
         RA_TELEMETRY = "off";
         shellHook = ''
-          echo "🦀 $(rustc --version) + rust-analyzer $(rust-analyzer --version)"
+          # 仅交互式 tty 打印横幅；`nix develop --command`（stdout 被管道接管、非 tty）
+          # 不打印，避免污染 exec 工具输出
+          if [ -t 1 ]; then
+            echo "🦀 $(rustc --version) + rust-analyzer $(rust-analyzer --version)"
+          fi
         '';
       };
     });

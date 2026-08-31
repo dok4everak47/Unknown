@@ -1,12 +1,14 @@
 mod agent;
 mod message;
 mod model;
+mod nix_runtime;
 mod runtime;
 mod session;
 mod tool;
 
 use crate::agent::Agent;
 use crate::model::OpenAICompatibleModel;
+use crate::runtime::{LocalRuntime, Runtime};
 use crate::session::Session;
 use message::Message;
 
@@ -21,6 +23,32 @@ fn session_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("session.json"))
 }
 
+/// 工具执行 Runtime 的选择：`MYAGENT_RUNTIME=local`（默认）/ `nix`。
+///
+/// 返回 `Err(String)` 表示配置无效或 nix 不可用，调用方据此清晰报错并 exit 1。
+fn build_runtime() -> Result<Box<dyn Runtime>, String> {
+    let value = match env::var("MYAGENT_RUNTIME") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => "local".to_string(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("MYAGENT_RUNTIME must be valid UTF-8".to_string());
+        }
+    };
+
+    match value.as_str() {
+        "local" => Ok(Box::new(LocalRuntime)),
+        "nix" => match crate::nix_runtime::NixRuntime::new() {
+            Ok(runtime) => Ok(Box::new(runtime)),
+            Err(err) => Err(format!(
+                "MYAGENT_RUNTIME=nix but nix is not available: {err}\n  install nix (https://nixos.org/download) or use MYAGENT_RUNTIME=local"
+            )),
+        },
+        other => Err(format!(
+            "unknown MYAGENT_RUNTIME value: {other:?} (expected \"local\" or \"nix\")"
+        )),
+    }
+}
+
 fn main() {
     let api_key = match env::var("OPENAI_API_KEY") {
         Ok(key) => key,
@@ -31,7 +59,17 @@ fn main() {
     };
 
     let model = OpenAICompatibleModel::new(api_key);
-    let agent = match Agent::new(model) {
+
+    // Runtime 选择：MYAGENT_RUNTIME=local（默认）/ nix（exec 落在 devShell）
+    let runtime = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
+    let agent = match Agent::new_with_runtime(model, runtime) {
         Ok(agent) => agent,
         Err(err) => {
             eprintln!("failed to initialize agent: {err}");

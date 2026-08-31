@@ -41,12 +41,13 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent、加载/保存 session）
+src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent、选择 Runtime、加载/保存 session）
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
 src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
-src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）
+src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command
+src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
 src/session.rs   conversation 持久化（Session::load / Session::save）
 ```
 
@@ -56,6 +57,14 @@ src/session.rs   conversation 持久化（Session::load / Session::save）
 ```text
 Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 ```
+
+`Runtime` 有两个实现：
+
+- `LocalRuntime`（默认）— std 直连文件系统与进程；
+- `NixRuntime` — 文件操作委托 `LocalRuntime`，exec 经 `nix develop --command`
+  在 flake.nix 声明的可复现 devShell 中执行（不改变文件语义）。
+
+CLI 通过 `MYAGENT_RUNTIME` 环境变量选择：`local`（默认）/ `nix`（构造时验证 nix 可用）。
 
 ## Principles
 
@@ -336,7 +345,7 @@ Waiting for approval.
 - [x] search
 - [x] exec
 - [x] Runtime abstraction
-- [ ] Nix Runtime
+- [x] Nix Runtime
 - [ ] Sandbox
 ```
 
@@ -445,6 +454,7 @@ edit_file
 exec（受控开发命令，白名单）
 session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
+Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。

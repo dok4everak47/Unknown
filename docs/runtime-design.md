@@ -1,8 +1,8 @@
 # Runtime 设计文档
 
-> 状态：**设计草案，未实现**
-> 关联：AGENTS.md（Principle 5：避免 premature abstraction）、README TODO（Nix Runtime / Sandbox / Capability system 未实现）
-> 本文只做架构分析与 API 草案，**不修改任何 src 代码**。
+> 状态：**§5 条件 2 已触发；`Runtime` trait 与 `NixRuntime` 已落地（2026-08-31）**
+> 关联：AGENTS.md、README TODO（Sandbox / Capability system 未实现）
+> §6 方案 B 草案与实际实现的差异见文末 §8「已落地形态」
 
 ---
 
@@ -323,6 +323,11 @@ pub struct Agent<M: Model, E: Executor = LocalExecutor> {
 **优点**：支持多 backend；默认 `LocalExecutor` 保持 `Agent::new` 兼容。
 **缺点**：引入 trait；需要把 `tool.rs` 的 5 个 `*_within` 函数收进 `LocalExecutor`（重构）；`Agent` 加一个泛型参数（所有测试需适配）。
 
+> **已落地形态与草案的差异**：实际实现没有用 `execute(&Tool, &RuntimeContext)`，
+> 而是把 trait 方法收敛为**四个副作用原语**（`read_file` / `write_file` / `read_dir`
+> / `exec`），命令解析、白名单与路径策略仍留在 `tool.rs`。这样工具层零改动，
+> 两个实现（`LocalRuntime` / `NixRuntime`）只实现副作用本身。详见 §8。
+
 ### 方案 C：capability 门（Stage 3 目标）
 
 ```rust
@@ -359,13 +364,35 @@ impl Default for Capabilities {
 
 ## 7. 当前明确不做
 
-以下全部**未实现**，且当前**无需求**，不要提前引入：
+已落地：`Runtime` trait（§5 条件 2）与 `NixRuntime`（见 §8）。以下仍**未实现**，
+且当前**无需求**，不要提前引入：
 
-- **Runtime trait / Executor trait** —— 只有一个 backend，抽象是负债（§2）
-- **RuntimeContext struct** —— 无可变超时/可控 env 需求（§5 条件 1 未触发）
-- **Nix Runtime** —— Nix 当前只做 `nix develop`，无工具执行可复现需求（§3）
+- **RuntimeContext struct** —— 无可变超时/可控 env 需求（§5 条件 1 未触发；
+  当前两个实现硬编码 60s 超时、继承 env）
 - **Sandbox** —— 模型可信 + 白名单已是最小权限，无防御需求（§3）
 - **Capability system** —— 无权限分化场景（§5 条件 3 未触发）
 - **Container** —— 无远程/隔离执行需求
 
-**判据**：上述任何一项，只有当 §5 的对应条件出现时才值得实现。在此之前，`tool.rs` 的 5 个 `*_within` + `Agent.root` + `EXEC_TIMEOUT` 常量就是最简正确形态。
+**判据**：上述任何一项，只有当 §5 的对应条件出现时才值得实现。
+
+## 8. 已落地形态（2026-08-31）
+
+§5 条件 2 已触发：exec 需要运行在可复现环境（nix devShell）。实际落地：
+
+- `Runtime` trait（`src/runtime.rs`）：四个副作用原语 `read_file` / `write_file` /
+  `read_dir` / `exec`。与 §6 方案 B 草案的差异是**没有 `execute(&Tool)`**——
+  工具层保持纯逻辑，命令解析 / 白名单 / 路径策略仍在 `tool.rs`。
+- `LocalRuntime`（`src/runtime.rs`）：std 直连文件系统与进程。
+- `NixRuntime`（`src/nix_runtime.rs`）：文件操作**委托** `LocalRuntime`（组合，
+  nix 不虚拟化文件系统，语义与本地完全一致）；exec 经 `nix develop --command`
+  在 flake.nix 声明的 devShell 中执行。构造时 `nix --version` 验证可用性；
+  argv 构造为纯函数 `nix_develop_argv`（无 nix 环境下可单元测试）。
+- 两个实现共用 `run_command`（spawn + 60s 超时轮询 + stdout/stderr 合并 + 退出码），
+  超时 / 输出 / 退出码语义逐字节一致（零行为回归）。
+- `Agent` 持有 `Box<dyn Runtime>`；CLI 用 `MYAGENT_RUNTIME=local|nix` 选择
+  （local 默认，nix 不存在时清晰报错并 exit 1）。
+- `flake.nix` `shellHook` 横幅改为仅交互式 tty 打印，避免污染
+  `nix develop --command` 的输出。
+
+仍未实现（后续方向）：Sandbox、Capability system、Container、RuntimeContext
+（timeout / env 可配）。
