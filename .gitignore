@@ -13,3 +13,6 @@ target/
 
 # macOS
 .DS_Store
+
+# pi harness session state (todos etc.)
+.pi/

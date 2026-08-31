@@ -1,18 +1,34 @@
 # Autoresearch Prompt: reduce release binary size
 
-- Status: **ended 2026-08-31 (continuation) — binary_kb 5852 → 1980 KB (-66.2%) pre-feature; post-NixRuntime-feature floor 1996 KB; thread ended, no in-scope lever remains**
+- Status: **ended (final) — binary_kb 5852 → 1928 KB (-67.1%) across 75 experiments; floor 1928 KB is deterministic (sha256-identical rebuilds), cold-reproducible, byte-accounted, and metric-quantized at 4 KB (needs ≥ 3,152 B to move, unreachable in-scope). Every dimension and config corner closed with evidence; zero in-scope hypotheses remain.**
 - Created: 2026-08-31
 - Owner: Pi autoresearch
 - Reviewer: Codex
 - Primary metric: `binary_kb`（lower is better）
 
-> **结束原因（2026-08-31）**：在 Nix Runtime 功能落地后，对当前 tree 重新基准，
-> floor 为 **1996 KB**（功能本身仅 ~1.7 KB 真实代码；~14 KB 磁盘增量来自 Mach-O
-> 段对齐 + code-signature 页哈希，属固有开销）。所有 in-scope 杠杆在 42 个实验 +
-> finalize + 复基准中全部 A/B 验证耗尽。唯一剩余杠杆 `-Z build-std`（std 以
-> -Oz+abort 重编，约省数十 KB）被记录为 out-of-scope：环境无 nightly/rustup，
-> 需安装 nightly 工具链，且会使每次 cargo check/test/clippy 全量重编 std。
-> 已记入 `.auto/ideas.md`，需正常审批流程批准后再尝试。
+> **最终状态（continuation session 补完）**：在 Nix Runtime / Capability 功能落地后，
+> 续接会话又找到 4 个真实杠杆，floor 从 1996 KB 降至 **1928 KB**：
+> - #51 `-fvisibility=hidden`（CFLAGS，隐藏 BoringSSL 非 API 导出）−8 KB
+> - #52 `build.rs cargo:rustc-link-arg-bins=-Wl,-no_exported_symbols`（仅 bin，导出表清空）−8 KB
+> - #55 `CFLAGS=-flto`（aws-lc C 转 bitcode，ld64 链接期 LTO 按函数粒度去死代码）−36 KB
+> - #56 `-Wl,-mllvm,-enable-machine-outliner=always`（C 代码 link-LTO 机器 outliner）−16 KB
+>
+> **完整关闭清单（75 实验）**：profile（opt=z/fat LTO/cgu=1/strip/abort）、Rust LLVM
+> passes（outliner −32 KB 保留，其余 A/B 或不可用）、C-LTO passes（outliner −16 KB 保留，
+> 其余 no-op/不可用）、CFLAGS（-Oz/-flto/fvisibility，unwind/function-sections 均为
+> Mach-O no-op）、linker flags（no_pie 因硬化拒绝、no_function_starts/no_compact_unwind
+> 为行为变更已量化、embed-bitcode 与 lto 互斥）、依赖 features（全部验证最小）、
+> 结构/段/签名/填充/绑定（零可删内容+零可删填充）、crash-diagnostics 量化矩阵
+> （fn-starts→1916、unwind_info→1908、合 1896 KB 可实现；eh_frame/gcc_except_tab
+> 无任何移除机制）、确定性（sha256 一致）。
+>
+> **仅剩路径 = 用户决策（正常审批流程）**：
+> 1. crash-diagnostics flags → **1896 KB**（build.rs 加两行，牺牲崩溃回溯粒度）
+> 2. reqwest `[patch]`-fork → 移除 platform-verifier（改 CA 信任源）/ tls12（仅 TLS 1.3）
+> 3. build-std → 需 crates.io/registry 网络（wasip1 未缓存，std 源码树无法解析）
+>
+> 此前 1996 KB 结论中的 build-std 阻塞描述已纠正：真正阻塞是环境网络（crates.io
+> 不可达），不是 nightly/rustup。
 
 > 原目标 `check_seconds` 已在实验 #5 确认到达硬性下限（0.09-0.11s = cargo floor 0.04s + active-graph metadata scan 0.05s；对源码大小、fingerprint 数量、-j、incremental 均不变）。
 > 按本文件规定的切换流程，现改为优化 **release 二进制体积** `binary_kb`（`WORKLOAD=size .auto/measure.sh`）。
