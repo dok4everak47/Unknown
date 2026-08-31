@@ -1,6 +1,7 @@
 mod agent;
 mod message;
 mod model;
+mod runtime;
 mod session;
 mod tool;
 

@@ -42,17 +42,19 @@ Final Response
 
 ```text
 src/main.rs      CLI entrypoint（输入输出、创建 Model / Agent、加载/保存 session）
-src/agent.rs     Agent Loop（Model ↔ Tool 协调、可注入 fake Model 测试）
+src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
-src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验
+src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
+src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）
 src/session.rs   conversation 持久化（Session::load / Session::save）
 ```
 
-核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦：
+核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦；
+工具的副作用执行与工具逻辑解耦（`Runtime` trait）：
 
 ```text
-Model → Response::ToolCall → Agent → Tool → Filesystem
+Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 ```
 
 ## Principles
@@ -332,8 +334,8 @@ Waiting for approval.
 - [x] read_file
 - [x] write_file
 - [x] search
-- [ ] exec
-- [ ] Runtime abstraction
+- [x] exec
+- [x] Runtime abstraction
 - [ ] Nix Runtime
 - [ ] Sandbox
 ```
@@ -442,6 +444,7 @@ search
 edit_file
 exec（受控开发命令，白名单）
 session persistence（单 session 保存/恢复）
+Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。

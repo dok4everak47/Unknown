@@ -14,7 +14,7 @@ Runtime
 Nix
 ```
 
-> ⚠️ 注意：`Runtime` 与 `Nix Runtime` 目前**尚未实现**，只作为未来方向。
+> ⚠️ 注意：`Nix Runtime` 目前**尚未实现**，只作为未来方向。`Runtime` 抽象（工具副作用原语）已实现，见下方代码结构。
 
 ## 当前状态
 
@@ -30,6 +30,7 @@ Nix
 - [x] `search` 工具
 - [x] `edit_file` 工具（精确文本替换）
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
+- [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
 - [x] Session persistence（conversation 保存/恢复，单 session）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
@@ -69,17 +70,18 @@ Final Response
 | --- | --- |
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
-| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验 |
+| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
+| `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现） |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
 | `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入，创建 Model / Agent，显示结果 |
 
 ### 依赖方向
 
-核心类型（`Message`）与 API 层类型（`ApiMessage`）分离；工具执行完全在 `tool.rs` 中，Model provider 不直接触碰文件系统；Agent Loop 只依赖 `Model` trait 与 `Tool` 的静态接口：
+核心类型（`Message`）与 API 层类型（`ApiMessage`）分离；工具的副作用执行与工具逻辑解耦（`Runtime` trait），Model provider 不触碰文件系统；Agent Loop 只依赖 `Model` trait 与 `Tool` 的静态接口，并持有 `Runtime`（默认 `LocalRuntime`，测试可注入 fake）：
 
 ```text
-Model → Response::ToolCall → Agent → Tool → Filesystem
+Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 ```
 
 ## Quick Start
@@ -156,8 +158,6 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 
 ```text
 Tool system（扩展更多 typed tools）
-    ↓
-Runtime abstraction
     ↓
 Nix Runtime
     ↓

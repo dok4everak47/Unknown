@@ -1,14 +1,13 @@
 use std::fmt;
-use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{ChildStderr, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
 
-/// `exec` 单次命令执行的最长时长。
-const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
-/// `exec` 超时轮询间隔。
-const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(50);
+use crate::runtime::{EntryKind, ExecError, ExecOutput, Runtime};
+
+#[cfg(test)]
+use crate::runtime::LocalRuntime;
+#[cfg(test)]
+use std::fs;
 
 /// 一个工具的参数 JSON Schema，用于请求中的 `tools` 字段。
 pub struct ToolDefinition {
@@ -314,17 +313,20 @@ impl Tool {
     }
 
     /// 在指定根目录下执行（便于测试与 Agent 注入 root）。
-    pub(crate) fn execute_in(&self, root: &Path) -> Result<String, ToolError> {
+    ///
+    /// 所有副作用都经由 `rt` 完成；`root` 是路径边界。工具自身不再直接
+    /// 触碰文件系统 / 进程（那些操作全部位于 [`Runtime`] 的实现中）。
+    pub(crate) fn execute(&self, rt: &dyn Runtime, root: &Path) -> Result<String, ToolError> {
         match self {
-            Tool::ReadFile(read_file) => read_file_within(root, &read_file.path),
+            Tool::ReadFile(read_file) => read_file_within(rt, root, &read_file.path),
             Tool::WriteFile(write_file) => {
-                write_file_within(root, &write_file.path, &write_file.content)
+                write_file_within(rt, root, &write_file.path, &write_file.content)
             }
-            Tool::Search(search) => search_within(root, &search.query, search.path.as_deref()),
+            Tool::Search(search) => search_within(rt, root, &search.query, search.path.as_deref()),
             Tool::EditFile(edit_file) => {
-                edit_file_within(root, &edit_file.path, &edit_file.old, &edit_file.new)
+                edit_file_within(rt, root, &edit_file.path, &edit_file.old, &edit_file.new)
             }
-            Tool::Exec(exec) => exec_within(root, &exec.command),
+            Tool::Exec(exec) => exec_within(rt, root, &exec.command),
         }
     }
 }
@@ -332,17 +334,24 @@ impl Tool {
 /// 读取文件，但限制路径必须位于 `root` 之内。
 ///
 /// 拒绝绝对路径、`..` 跳转，以及通过 symlink 逃逸出 `root` 的路径。
-fn read_file_within(root: &Path, path: &str) -> Result<String, ToolError> {
+fn read_file_within(rt: &dyn Runtime, root: &Path, path: &str) -> Result<String, ToolError> {
     let resolved = resolve_within(root, path, false)?;
-    fs::read_to_string(&resolved).map_err(ToolError::Io)
+    rt.read_file(&resolved)
+        .map_err(ToolError::Io)
 }
 
 /// 写入文件，但限制路径必须位于 `root` 之内。
 ///
 /// 与 `read_file_within` 共用同一套路径边界校验。
-fn write_file_within(root: &Path, path: &str, content: &str) -> Result<String, ToolError> {
+fn write_file_within(
+    rt: &dyn Runtime,
+    root: &Path,
+    path: &str,
+    content: &str,
+) -> Result<String, ToolError> {
     let resolved = resolve_within(root, path, true)?;
-    fs::write(&resolved, content).map_err(ToolError::Io)?;
+    rt.write_file(&resolved, content)
+        .map_err(ToolError::Io)?;
     Ok(format!("wrote {} bytes to {}", content.len(), path))
 }
 
@@ -355,7 +364,13 @@ fn write_file_within(root: &Path, path: &str, content: &str) -> Result<String, T
 ///
 /// 只有确认恰好一次之后才写回文件；任何失败路径都不会修改原文件。
 /// 第一版只处理有效 UTF-8 文本文件，不做编码检测。
-fn edit_file_within(root: &Path, path: &str, old: &str, new: &str) -> Result<String, ToolError> {
+fn edit_file_within(
+    rt: &dyn Runtime,
+    root: &Path,
+    path: &str,
+    old: &str,
+    new: &str,
+) -> Result<String, ToolError> {
     if old.is_empty() {
         return Err(ToolError::InvalidArguments(
             "edit_file requires a non-empty `old`".to_string(),
@@ -363,13 +378,15 @@ fn edit_file_within(root: &Path, path: &str, old: &str, new: &str) -> Result<Str
     }
 
     let resolved = resolve_within(root, path, false)?;
-    let content = fs::read_to_string(&resolved).map_err(|err| match err.kind() {
-        // read_to_string 对非 UTF-8 文件返回 InvalidData
-        io::ErrorKind::InvalidData => {
-            ToolError::InvalidArguments(format!("{path} is not a valid UTF-8 text file"))
-        }
-        _ => ToolError::Io(err),
-    })?;
+    let content = rt
+        .read_file(&resolved)
+        .map_err(|err| match err.kind() {
+            // read_to_string 对非 UTF-8 文件返回 InvalidData
+            io::ErrorKind::InvalidData => {
+                ToolError::InvalidArguments(format!("{path} is not a valid UTF-8 text file"))
+            }
+            _ => ToolError::Io(err),
+        })?;
 
     match content.matches(old).count() {
         0 => return Err(ToolError::OldTextNotFound(path.to_string())),
@@ -378,7 +395,8 @@ fn edit_file_within(root: &Path, path: &str, old: &str, new: &str) -> Result<Str
     }
 
     let replaced = content.replacen(old, new, 1);
-    fs::write(&resolved, replaced).map_err(ToolError::Io)?;
+    rt.write_file(&resolved, &replaced)
+        .map_err(ToolError::Io)?;
     Ok(format!("edited {path} successfully"))
 }
 
@@ -461,74 +479,22 @@ fn is_valid_arg(arg: &str) -> bool {
 ///
 /// 安全约束：
 /// - 只允许 `cargo check/build/test/clippy/fmt --check`（白名单，见 [`ExecCommand::parse`]）
-/// - 不使用 shell；通过 [`std::process::Command`] 直接传可执行文件与参数
+/// - 不使用 shell；进程执行位于 [`Runtime::exec`]（对应 `std::process::Command` 直调）
 /// - 工作目录固定为 `root`，继承当前环境变量（模型无法修改）
 /// - 60 秒超时，超时返回已捕获的输出
-fn exec_within(root: &Path, command: &str) -> Result<String, ToolError> {
+fn exec_within(rt: &dyn Runtime, root: &Path, command: &str) -> Result<String, ToolError> {
     let parsed = ExecCommand::parse(command)?;
-
-    let mut child = Command::new(&parsed.program)
-        .args(&parsed.args)
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ToolError::Io)?;
-
-    // 先接管 stdout/stderr，避免子进程输出写满管道时阻塞
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() > EXEC_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let output = collect_output(stdout, stderr);
-                    return Err(ToolError::TimedOut(output));
-                }
-                std::thread::sleep(EXEC_POLL_INTERVAL);
-            }
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ToolError::Io(err));
+    match rt.exec(&parsed.program, &parsed.args, root) {
+        Ok(ExecOutput { code, output }) => {
+            if code == 0 {
+                Ok(format!("exit code: {code}\n\nstdout:\n{output}\nstderr:\n"))
+            } else {
+                Err(ToolError::NonZeroExit(code, output))
             }
         }
-    };
-
-    // 等子进程退出后再统一读取，输出量小不会死锁
-    let output = collect_output(stdout, stderr);
-
-    let code = status.code().unwrap_or(-1);
-    if status.success() {
-        Ok(format!("exit code: {code}\n\nstdout:\n{output}\nstderr:\n"))
-    } else {
-        Err(ToolError::NonZeroExit(code, output))
+        Err(ExecError::Io(err)) => Err(ToolError::Io(err)),
+        Err(ExecError::TimedOut(output)) => Err(ToolError::TimedOut(output)),
     }
-}
-
-/// 依次读取 stdout 与 stderr 管道（子进程已退出，不会阻塞）。
-fn collect_output(mut stdout: ChildStdout, mut stderr: ChildStderr) -> String {
-    let mut out = String::new();
-    let mut err = String::new();
-    let _ = stdout.read_to_string(&mut out);
-    let _ = stderr.read_to_string(&mut err);
-
-    let mut output = String::new();
-    if !out.is_empty() {
-        output.push_str(&out);
-    }
-    if !err.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&err);
-    }
-    output
 }
 
 /// 校验路径是否位于 `root` 之内，并返回 canonicalized 后的路径。
@@ -592,7 +558,12 @@ fn resolve_within(root: &Path, path: &str, allow_missing: bool) -> Result<PathBu
 ///
 /// `path` 为 None 时从 `root` 开始递归搜索；为 Some 时限制在该路径
 /// （可以是文件或目录）范围内。结果中的路径相对于 `root`。
-fn search_within(root: &Path, query: &str, path: Option<&str>) -> Result<String, ToolError> {
+fn search_within(
+    rt: &dyn Runtime,
+    root: &Path,
+    query: &str,
+    path: Option<&str>,
+) -> Result<String, ToolError> {
     let root = root.canonicalize().map_err(ToolError::Io)?;
     let start = match path {
         Some(p) => resolve_within(&root, p, false)?,
@@ -602,9 +573,9 @@ fn search_within(root: &Path, query: &str, path: Option<&str>) -> Result<String,
     let mut matches: Vec<String> = Vec::new();
 
     if start.is_file() {
-        search_file(&root, &start, query, &mut matches);
+        search_file(rt, &root, &start, query, &mut matches);
     } else if start.is_dir() {
-        walk_dir(&root, &start, query, &mut matches);
+        walk_dir(rt, &root, &start, query, &mut matches);
     } else {
         return Err(ToolError::NotFound(path.unwrap_or(".").to_string()));
     }
@@ -617,31 +588,27 @@ fn search_within(root: &Path, query: &str, path: Option<&str>) -> Result<String,
 }
 
 /// 递归遍历目录，跳过无法读取的条目与 symlink（避免逃逸与循环）。
-fn walk_dir(root: &Path, dir: &Path, query: &str, matches: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn walk_dir(rt: &dyn Runtime, root: &Path, dir: &Path, query: &str, matches: &mut Vec<String>) {
+    let Ok(entries) = rt.read_dir(dir) else {
         return;
     };
 
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.path();
-        if file_type.is_dir() {
-            walk_dir(root, &path, query, matches);
-        } else if file_type.is_file() {
-            search_file(root, &path, query, matches);
+    for entry in entries {
+        match entry.kind {
+            EntryKind::Dir => walk_dir(rt, root, &entry.path, query, matches),
+            EntryKind::File => search_file(rt, root, &entry.path, query, matches),
+            // symlink 等其他类型不跟随、不搜索
+            EntryKind::Symlink | EntryKind::Other => {}
         }
-        // symlink 等其他类型不跟随、不搜索
     }
 }
 
 /// 在单个文件内搜索，跳过二进制 / 非 UTF-8 / 无法读取的文件。
-fn search_file(root: &Path, file: &Path, query: &str, matches: &mut Vec<String>) {
-    let Ok(bytes) = fs::read(file) else {
-        return;
-    };
-    let Ok(text) = String::from_utf8(bytes) else {
+///
+/// 文件读取经由 `rt.read_file`（`read_to_string` 语义）：非 UTF-8 / 无法读取
+/// 的文件返回错误，按"跳过该文件"处理（与旧 `fs::read` + `from_utf8` 行为一致）。
+fn search_file(rt: &dyn Runtime, root: &Path, file: &Path, query: &str, matches: &mut Vec<String>) {
+    let Ok(text) = rt.read_file(file) else {
         return;
     };
 
@@ -677,7 +644,7 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "main.rs".to_string(),
         });
-        assert_eq!(tool.execute_in(&root).unwrap(), "fn main() {}");
+        assert_eq!(tool.execute(&LocalRuntime, &root).unwrap(), "fn main() {}");
     }
 
     #[test]
@@ -690,7 +657,7 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "src/lib.rs".to_string(),
         });
-        assert_eq!(tool.execute_in(&root).unwrap(), "pub fn f() {}");
+        assert_eq!(tool.execute(&LocalRuntime, &root).unwrap(), "pub fn f() {}");
     }
 
     #[test]
@@ -700,7 +667,7 @@ mod tests {
             path: "../../etc/passwd".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -712,7 +679,7 @@ mod tests {
             path: "/etc/passwd".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -733,7 +700,7 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "link.txt".to_string(),
         });
-        let result = tool.execute_in(&root);
+        let result = tool.execute(&LocalRuntime, &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -746,7 +713,7 @@ mod tests {
             path: "missing.rs".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -811,7 +778,7 @@ mod tests {
             content: "hello world".to_string(),
         });
 
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("out.txt"));
 
         let written = fs::read_to_string(root.join("out.txt")).unwrap();
@@ -828,7 +795,7 @@ mod tests {
             path: "src/lib.rs".to_string(),
             content: "pub fn f() {}".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         let written = fs::read_to_string(root.join("src/lib.rs")).unwrap();
         assert_eq!(written, "pub fn f() {}");
@@ -843,7 +810,7 @@ mod tests {
             path: "out.txt".to_string(),
             content: "new".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "new");
     }
@@ -856,7 +823,7 @@ mod tests {
             content: "evil".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -869,7 +836,7 @@ mod tests {
             content: "evil".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -891,7 +858,7 @@ mod tests {
             path: "link.txt".to_string(),
             content: "evil".to_string(),
         });
-        let result = tool.execute_in(&root);
+        let result = tool.execute(&LocalRuntime, &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -905,7 +872,7 @@ mod tests {
             content: "x".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -924,7 +891,7 @@ mod tests {
             query: "Model".to_string(),
             path: None,
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("src/model.rs:1:pub struct Model {}"));
         assert!(result.contains("src/model.rs:3:// Model again"));
     }
@@ -941,7 +908,7 @@ mod tests {
             query: "needle".to_string(),
             path: Some("src".to_string()),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("src/a.rs:1:needle here"));
         assert!(!result.contains("tests/b.rs"));
     }
@@ -957,7 +924,7 @@ mod tests {
             query: "needle".to_string(),
             path: Some("src/a.rs".to_string()),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("src/a.rs:1:needle"));
         assert!(!result.contains("src/b.rs"));
     }
@@ -971,7 +938,7 @@ mod tests {
             query: "zzz".to_string(),
             path: None,
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("no matches"));
     }
 
@@ -1015,7 +982,7 @@ mod tests {
             path: Some("../../etc".to_string()),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1028,7 +995,7 @@ mod tests {
             path: Some("/etc".to_string()),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1041,7 +1008,7 @@ mod tests {
             path: Some("missing".to_string()),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -1064,7 +1031,7 @@ mod tests {
             query: "needle".to_string(),
             path: Some("link".to_string()),
         });
-        let result = tool.execute_in(&root);
+        let result = tool.execute(&LocalRuntime, &root);
 
         fs::remove_dir_all(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -1089,7 +1056,7 @@ mod tests {
             query: "needle".to_string(),
             path: None,
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
 
         fs::remove_dir_all(&outside).ok();
         assert!(result.contains("no matches"), "unexpected: {result}");
@@ -1109,7 +1076,7 @@ mod tests {
             query: "needle".to_string(),
             path: None,
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("text.rs:1:needle"));
         assert!(!result.contains("blob.bin"));
     }
@@ -1167,7 +1134,7 @@ mod tests {
             old: "hello".to_string(),
             new: "goodbye".to_string(),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("a.txt"));
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
@@ -1184,7 +1151,7 @@ mod tests {
             old: "line two".to_string(),
             new: "LINE TWO".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "line one\nLINE TWO\nline three\n");
@@ -1201,7 +1168,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OldTextNotFound(_))
         ));
     }
@@ -1217,7 +1184,7 @@ mod tests {
             new: "goodbye".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::MultipleMatches(_))
         ));
 
@@ -1238,7 +1205,7 @@ mod tests {
             new: "b".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::MultipleMatches(_))
         ));
     }
@@ -1253,7 +1220,7 @@ mod tests {
             old: "one\ntwo".to_string(),
             new: "ONE\nTWO".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "ONE\nTWO\nthree\n");
@@ -1270,7 +1237,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::InvalidArguments(_))
         ));
     }
@@ -1284,7 +1251,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -1298,7 +1265,7 @@ mod tests {
             new: "x".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1312,7 +1279,7 @@ mod tests {
             new: "x".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1335,7 +1302,7 @@ mod tests {
             old: "outside".to_string(),
             new: "inside".to_string(),
         });
-        let result = tool.execute_in(&root);
+        let result = tool.execute(&LocalRuntime, &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -1352,7 +1319,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::InvalidArguments(_))
         ));
 
@@ -1372,7 +1339,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute_in(&root),
+            tool.execute(&LocalRuntime, &root),
             Err(ToolError::MultipleMatches(_))
         ));
     }
@@ -1387,7 +1354,7 @@ mod tests {
             old: "hello".to_string(),
             new: "hello".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "hello\n");
@@ -1403,7 +1370,7 @@ mod tests {
             old: "return foo".to_string(),
             new: "return bar".to_string(),
         });
-        tool.execute_in(&root).unwrap();
+        tool.execute(&LocalRuntime, &root).unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "function foo() { return bar; }");
@@ -1684,7 +1651,7 @@ mod exec_tests {
         let args = serde_json::json!({ "command": "echo hello" });
         let tool = Tool::from_call("exec", &args).unwrap();
         assert!(matches!(
-            tool.execute_in(Path::new(".")),
+            tool.execute(&LocalRuntime, Path::new(".")),
             Err(ToolError::CommandNotAllowed(_))
         ));
     }
@@ -1695,7 +1662,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo test --offline".to_string(),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
         assert!(result.contains("test result: ok"), "unexpected: {result}");
     }
@@ -1706,7 +1673,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo build --offline".to_string(),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
     }
 
@@ -1716,7 +1683,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo clippy --offline".to_string(),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
     }
 
@@ -1728,7 +1695,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        match tool.execute_in(&root) {
+        match tool.execute(&LocalRuntime, &root) {
             Err(ToolError::NonZeroExit(code, output)) => {
                 assert_ne!(code, 0);
                 assert!(
@@ -1746,7 +1713,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        let result = tool.execute_in(&root).unwrap();
+        let result = tool.execute(&LocalRuntime, &root).unwrap();
         assert!(
             result.contains("myagent-exec-fixture"),
             "unexpected: {result}"
@@ -1761,7 +1728,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        match tool.execute_in(&root) {
+        match tool.execute(&LocalRuntime, &root) {
             Err(ToolError::NonZeroExit(_, output)) => {
                 // cargo 将编译错误写到 stderr，应出现在结果里
                 assert!(

@@ -1,5 +1,6 @@
 use crate::message::Message;
 use crate::model::{Model, Response};
+use crate::runtime::{LocalRuntime, Runtime};
 use crate::tool::Tool;
 
 use std::fmt;
@@ -49,13 +50,19 @@ pub struct Agent<M: Model> {
     model: M,
     /// 所有文件工具的执行边界（与当前 `Tool::execute` 的 cwd 语义一致）。
     root: PathBuf,
+    /// 工具执行的副作用 Runtime（默认 [`LocalRuntime`]，测试可注入 fake）。
+    runtime: Box<dyn Runtime>,
 }
 
 impl<M: Model> Agent<M> {
     /// 以当前工作目录作为工具执行根目录创建 Agent。
     pub fn new(model: M) -> Result<Self, std::io::Error> {
         let root = std::env::current_dir()?;
-        Ok(Self { model, root })
+        Ok(Self {
+            model,
+            root,
+            runtime: Box::new(LocalRuntime),
+        })
     }
 
     /// 测试辅助（仅测试构建）：在指定根目录下创建 Agent。
@@ -63,7 +70,27 @@ impl<M: Model> Agent<M> {
     /// 供 model.rs 的集成测试用 mock server 驱动真实 `OpenAICompatibleModel`。
     #[cfg(test)]
     pub(crate) fn new_with_root_for_test(model: M, root: PathBuf) -> Self {
-        Self { model, root }
+        Self {
+            model,
+            root,
+            runtime: Box::new(LocalRuntime),
+        }
+    }
+
+    /// 测试辅助（仅测试构建）：注入自定义 Runtime（如 [`FakeRuntime`]）。
+    ///
+    /// 供 agent.rs 测试验证工具执行确实经由注入的 Runtime 完成。
+    #[cfg(test)]
+    pub(crate) fn new_with_runtime_for_test(
+        model: M,
+        root: PathBuf,
+        runtime: Box<dyn Runtime>,
+    ) -> Self {
+        Self {
+            model,
+            root,
+            runtime,
+        }
     }
 
     /// 处理一次用户输入：可能触发多轮 model ↔ tool 交互，
@@ -101,7 +128,7 @@ impl<M: Model> Agent<M> {
                     conversation.push(Message::assistant_tool_calls(calls.clone()));
                     for call in calls {
                         let result = match Tool::from_call(&call.name, &call.arguments) {
-                            Ok(tool) => match tool.execute_in(&self.root) {
+                            Ok(tool) => match tool.execute(self.runtime.as_ref(), &self.root) {
                                 Ok(text) => text,
                                 Err(err) => format!("tool error: {err}"),
                             },
@@ -125,8 +152,13 @@ mod tests {
     use super::*;
     use crate::message::{Role, ToolCall};
     use crate::model::Response;
+    use crate::runtime::{ExecError, ExecOutput, RuntimeEntry};
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::fs;
+    use std::io;
+    use std::path::Path;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -142,7 +174,11 @@ mod tests {
 
     /// 在指定根目录下创建 Agent（测试辅助，便于隔离工具副作用）。
     fn new_with_root<M: Model>(model: M, root: PathBuf) -> Agent<M> {
-        Agent { model, root }
+        Agent {
+            model,
+            root,
+            runtime: Box::new(LocalRuntime),
+        }
     }
 
     /// 可编程 fake Model：按顺序返回预设的 [`Response`]，并记录每次收到的 messages。
@@ -424,5 +460,117 @@ mod tests {
             conversation[3].content
         );
         assert_eq!(conversation[4].content, "both worked");
+    }
+
+    /// 可编程 fake Runtime：脚本化返回文件内容 / 命令结果，不触碰真实文件系统。
+    ///
+    /// 每次调用都记录到共享调用日志（`Rc<RefCell<Vec<String>>>`），供测试
+    /// 断言工具执行确实经由注入的 Runtime 完成。
+    struct FakeRuntime {
+        /// path（文件名）→ 脚本化文件内容（`read_file` 命中时返回）。
+        files: HashMap<String, String>,
+        /// 调用日志：`"read_file:<resolved-path>"` 形式的记录。
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl FakeRuntime {
+        fn new() -> Self {
+            Self {
+                files: HashMap::new(),
+                log: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        /// 脚本化一个文件的内容（按文件名匹配）。
+        fn with_file(mut self, name: &str, content: &str) -> Self {
+            self.files
+                .insert(name.to_string(), content.to_string());
+            self
+        }
+
+        /// 共享调用日志（跨 Box 边界读取）。
+        fn log(&self) -> Rc<RefCell<Vec<String>>> {
+            Rc::clone(&self.log)
+        }
+    }
+
+    impl Runtime for FakeRuntime {
+        fn read_file(&self, path: &Path) -> io::Result<String> {
+            self.log
+                .borrow_mut()
+                .push(format!("read_file:{}", path.display()));
+            let key = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            self.files
+                .get(key)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fake runtime: not found"))
+        }
+
+        fn write_file(&self, path: &Path, _content: &str) -> io::Result<()> {
+            self.log
+                .borrow_mut()
+                .push(format!("write_file:{}", path.display()));
+            Ok(())
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<RuntimeEntry>> {
+            self.log
+                .borrow_mut()
+                .push(format!("read_dir:{}", path.display()));
+            Ok(Vec::new())
+        }
+
+        fn exec(
+            &self,
+            program: &str,
+            _args: &[String],
+            cwd: &Path,
+        ) -> Result<ExecOutput, ExecError> {
+            self.log
+                .borrow_mut()
+                .push(format!("exec:{program} cwd={}", cwd.display()));
+            Ok(ExecOutput {
+                code: 0,
+                output: "fake exec ok".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn tool_execution_goes_through_injected_runtime() {
+        let root = temp_root();
+        // 真实文件系统上的 note.txt 内容与 FakeRuntime 脚本化的内容不同：
+        // 若工具绕过 Runtime 直接读文件，会得到 "real content"。
+        fs::write(root.join("note.txt"), "real content").unwrap();
+        let model = FakeModel::new(vec![
+            Response::ToolCall(vec![tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({ "path": "note.txt" }),
+            )]),
+            Response::Text("got it".to_string()),
+        ]);
+        let runtime = FakeRuntime::new().with_file("note.txt", "scripted content");
+        let log = runtime.log();
+        let agent = Agent::new_with_runtime_for_test(model, root, Box::new(runtime));
+
+        let mut conversation = Vec::new();
+        agent
+            .run_turn(&mut conversation, "read the note")
+            .unwrap();
+
+        // 工具结果来自 FakeRuntime 的脚本化内容，而不是真实文件系统（"real content"）
+        assert_eq!(conversation[2].content, "scripted content");
+        // 调用日志证明 read_file 确实经由注入的 Runtime 完成
+        let calls = log.borrow();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        assert!(
+            calls[0].starts_with("read_file:") && calls[0].ends_with("note.txt"),
+            "got: {}",
+            calls[0]
+        );
     }
 }
