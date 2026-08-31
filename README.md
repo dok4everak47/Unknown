@@ -27,6 +27,7 @@ Nix
 - [x] 多轮 conversation（保留完整历史）
 - [x] Agent Loop
 - [x] Tool Calling（模型可发起工具调用）
+- [x] Streaming（SSE 流式输出：逐字显示回复，根治长请求被代理空闲超时掐断）
 - [x] `read_file` 工具
 - [x] `write_file` 工具
 - [x] `search` 工具
@@ -71,7 +72,7 @@ Final Response
 | 文件 | 职责 |
 | --- | --- |
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
-| `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
+| `src/model.rs` | `Model` trait + OpenAI-compatible provider + SSE 流式（`complete_streaming`）+ API 层序列化 |
 | `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
 | `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command` |
@@ -204,7 +205,6 @@ Sandbox
 
 - 更多工具
 - 更好的错误处理
-- streaming
 - sessions
 - MCP
 - subagents

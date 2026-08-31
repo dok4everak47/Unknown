@@ -10,10 +10,9 @@ mod tool;
 
 use crate::agent::Agent;
 use crate::capabilities::Capabilities;
-use crate::model::OpenAICompatibleModel;
+use crate::model::{ModelEvent, OpenAICompatibleModel};
 use crate::runtime::{LocalRuntime, Runtime};
 use crate::session::Session;
-use message::Message;
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -141,23 +140,39 @@ fn main() {
             continue;
         }
 
-        match agent.run_turn(&mut conversation, text) {
+        // 流式：收到第一个 TextDelta 时惰性打印 "AI: " 前缀，随后逐段输出并 flush；
+        // 工具轮次期间（模型只发工具调用、无文本）不打印任何内容。
+        let mut prefix_printed = false;
+        let mut printed_any = false;
+        let result = agent.run_turn_streaming(&mut conversation, text, &mut |event| {
+            let ModelEvent::TextDelta(delta) = event;
+            if !prefix_printed {
+                print!("AI: ");
+                prefix_printed = true;
+            }
+            print!("{delta}");
+            printed_any = true;
+            io::stdout()
+                .flush()
+                .expect("failed to flush stdout");
+        });
+
+        match result {
             Ok(()) => {
-                // run_turn 成功时最后一条消息是模型的文本回答
-                if let Some(Message {
-                    role: message::Role::Assistant,
-                    content,
-                    ..
-                }) = conversation.last()
-                {
-                    println!("AI: {content}");
+                // 有增量输出则补换行（避免覆盖行内打字效果）
+                if printed_any {
+                    println!();
                 }
-                // 每轮成功完成后保存；Model error 时 run_turn 已回滚，不保存半成品
+                // 每轮成功完成后保存；Model error 时 run_turn_streaming 已回滚，不保存半成品
                 if let Err(err) = Session::save(&path, &conversation) {
                     eprintln!("failed to save session: {err}");
                 }
             }
             Err(err) => {
+                // 已打印部分内容时先换行，避免错误信息粘在残句上
+                if printed_any {
+                    println!();
+                }
                 eprintln!("error: {err}");
                 let mut source = std::error::Error::source(&err);
                 while let Some(cause) = source {

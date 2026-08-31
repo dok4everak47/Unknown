@@ -1,6 +1,6 @@
 use crate::capabilities::Capabilities;
 use crate::message::Message;
-use crate::model::{Model, Response};
+use crate::model::{Model, ModelEvent, Response};
 use crate::runtime::{LocalRuntime, Runtime};
 use crate::tool::Tool;
 
@@ -153,10 +153,30 @@ impl<M: Model> Agent<M> {
     ///   已回滚到本输入开始之前，保持对话状态一致。
     ///
     /// 工具执行错误不会中止本方法：它们作为 Tool Result 回传给 Model。
+    ///
+    /// 等价于 [`Agent::run_turn_streaming`] 传 no-op 事件回调（不显示增量）。
+    ///
+    /// 当前二进制入口已改用流式 [`Agent::run_turn_streaming`]，本方法主要
+    /// 供测试调用（fake Model / mock server 集成测试），故 allow dead_code。
+    #[allow(dead_code)]
     pub fn run_turn(
         &self,
         conversation: &mut Vec<Message>,
         user_text: &str,
+    ) -> Result<(), AgentError> {
+        self.run_turn_streaming(conversation, user_text, &mut |_| {})
+    }
+
+    /// 处理一次用户输入（流式）：与 [`Agent::run_turn`] 逻辑逐字一致，
+    /// 仅把模型调用换成 [`Model::complete_streaming`]，模型生成的文本增量
+    /// 经 `on_event` 实时发出，供 UI 逐字显示。
+    ///
+    /// 工具调用过程不产生文本事件；能力门、工具分发、轮数上限、回滚逻辑不变。
+    pub fn run_turn_streaming(
+        &self,
+        conversation: &mut Vec<Message>,
+        user_text: &str,
+        on_event: &mut dyn FnMut(ModelEvent),
     ) -> Result<(), AgentError> {
         // 记录本回合开始的位置，出错时回滚到此处
         let turn_start = conversation.len();
@@ -165,7 +185,10 @@ impl<M: Model> Agent<M> {
         let mut tool_rounds = 0;
 
         loop {
-            match self.model.complete(conversation) {
+            match self
+                .model
+                .complete_streaming(conversation, on_event)
+            {
                 Ok(Response::Text(answer)) => {
                     conversation.push(Message::assistant(answer));
                     return Ok(());
@@ -324,6 +347,31 @@ mod tests {
         assert_eq!(conversation[1].content, "hello back");
         // 模型只被调用一次
         assert_eq!(agent.model.calls(), 1);
+    }
+
+    /// 流式路径：FakeModel 走默认 [`Model::complete_streaming`]，把最终文本作为
+    /// 单个 delta 发出，且与 `run_turn` 产生完全相同的 conversation。
+    #[test]
+    fn streaming_emits_text_delta_via_default_impl() {
+        let root = temp_root();
+        let model = FakeModel::new(vec![Response::Text("streamed hello".to_string())]);
+        let agent = new_with_root(model, root);
+
+        let mut conversation = Vec::new();
+        let mut deltas = Vec::new();
+        agent
+            .run_turn_streaming(&mut conversation, "hi", &mut |event| {
+                let ModelEvent::TextDelta(text) = event;
+                deltas.push(text);
+            })
+            .unwrap();
+
+        // 默认实现把完整文本作为单个 delta 发出
+        assert_eq!(deltas, vec!["streamed hello".to_string()]);
+        // conversation 与 run_turn 一致
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation[0].content, "hi");
+        assert_eq!(conversation[1].content, "streamed hello");
     }
 
     #[test]
