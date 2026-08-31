@@ -14,7 +14,9 @@ Runtime
 Nix
 ```
 
-> ⚠️ 注意：`Sandbox` / `Capability system` 目前**尚未实现**，只作为未来方向。`Runtime` 抽象（工具副作用原语）与 `Nix Runtime` 已实现，见下方代码结构。
+> ⚠️ 注意：`Sandbox` 目前**尚未实现**，只作为未来方向。`Capability-based execution`
+> （只读模式，`MYAGENT_READ_ONLY`）已实现；`Runtime` 抽象（工具副作用原语）与
+> `Nix Runtime` 也已实现，见下方代码结构。
 
 ## 当前状态
 
@@ -32,6 +34,7 @@ Nix
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
 - [x] Nix Runtime（`NixRuntime`：exec 经 `nix develop --command` 落在可复现 devShell）
+- [x] Capability-based execution（`Capabilities` 权限门；`MYAGENT_READ_ONLY=1/true` 只读模式）
 - [x] Session persistence（conversation 保存/恢复，单 session）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
@@ -40,7 +43,6 @@ Nix
 尚未实现：
 
 - [ ] Sandbox
-- [ ] Capability system
 - [ ] MCP
 - [ ] subagents
 
@@ -71,6 +73,7 @@ Final Response
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + API 层序列化 |
 | `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
+| `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command` |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
@@ -90,6 +93,11 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 - `local`（默认）— `LocalRuntime`，std 直连文件系统与进程；
 - `nix` — `NixRuntime`，文件操作委托本地（nix 不虚拟化文件系统），exec 经
   `nix develop --command` 在 flake.nix 声明的可复现 devShell 中执行（构造时验证 nix 可用）。
+
+工具执行前还有一道能力门（`Capabilities`，`src/capabilities.rs`），CLI 用
+`MYAGENT_READ_ONLY` 控制：`1` / `true` 时为只读模式（`write_file` / `edit_file` /
+`exec` 被拒，拒绝作为 Tool Result 回传 Model，不触碰 `Runtime`），其余为全允许。
+`MYAGENT_READ_ONLY` 与 `MYAGENT_RUNTIME` 正交可组合，默认行为零变化。
 
 ## Quick Start
 
@@ -112,9 +120,13 @@ export OPENAI_MODEL="..."           # 可选，默认 gpt-4o-mini
 运行：
 
 ```bash
-cargo run                 # 默认：exec 直接在当前环境执行（MYAGENT_RUNTIME=local）
+cargo run                 # 默认：exec 直接在当前环境执行（MYAGENT_RUNTIME=local），全能力
 MYAGENT_RUNTIME=nix cargo run   # exec 经 `nix develop --command` 在 devShell 中执行
+MYAGENT_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行命令（与 MYAGENT_RUNTIME 正交）
 ```
+
+启动时会在 stderr 打印一行当前能力模式（`capabilities: full` / `capabilities: read-only`），
+便于确认设置是否生效。
 
 示例对话：
 
@@ -171,7 +183,7 @@ flake.nix 声明的可复现 devShell 中执行（文件操作仍走本地）。
 ```text
 Tool system（扩展更多 typed tools）
     ↓
-Capability-based execution
+Capability-based execution ✅（已实现：只读模式，MYAGENT_READ_ONLY）
     ↓
 Sandbox
 ```
@@ -184,4 +196,4 @@ Sandbox
 - sessions
 - MCP
 - subagents
-- 更精细的权限 / 沙箱（Capability system / Sandbox）
+- 沙箱（Sandbox：在能力门之上的真实隔离）

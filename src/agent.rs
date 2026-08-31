@@ -1,3 +1,4 @@
+use crate::capabilities::Capabilities;
 use crate::message::Message;
 use crate::model::{Model, Response};
 use crate::runtime::{LocalRuntime, Runtime};
@@ -52,6 +53,8 @@ pub struct Agent<M: Model> {
     root: PathBuf,
     /// 工具执行的副作用 Runtime（默认 [`LocalRuntime`]，测试可注入 fake）。
     runtime: Box<dyn Runtime>,
+    /// 工具执行前的权限门（默认全允许，行为零变化）。
+    capabilities: Capabilities,
 }
 
 impl<M: Model> Agent<M> {
@@ -69,11 +72,25 @@ impl<M: Model> Agent<M> {
     /// 与 [`Agent::new`] 的区别：允许调用方选择副作用 Runtime，例如
     /// [`NixRuntime`]（`src/nix_runtime.rs`）让 exec 在 nix devShell 中执行。
     pub fn new_with_runtime(model: M, runtime: Box<dyn Runtime>) -> Result<Self, std::io::Error> {
+        // 未显式指定能力时使用全允许（保持既有行为）。
+        Self::new_with_runtime_and_caps(model, runtime, Capabilities::default())
+    }
+
+    /// 以当前工作目录作为工具执行根目录、注入指定 Runtime 与能力创建 Agent。
+    ///
+    /// 与 [`Agent::new_with_runtime`] 的区别：允许调用方通过 [`Capabilities`]
+    /// 收窄工具集（例如 `Capabilities::read_only()` 只允许读文件）。
+    pub fn new_with_runtime_and_caps(
+        model: M,
+        runtime: Box<dyn Runtime>,
+        capabilities: Capabilities,
+    ) -> Result<Self, std::io::Error> {
         let root = std::env::current_dir()?;
         Ok(Self {
             model,
             root,
             runtime,
+            capabilities,
         })
     }
 
@@ -86,6 +103,7 @@ impl<M: Model> Agent<M> {
             model,
             root,
             runtime: Box::new(LocalRuntime),
+            capabilities: Capabilities::default(),
         }
     }
 
@@ -98,10 +116,24 @@ impl<M: Model> Agent<M> {
         root: PathBuf,
         runtime: Box<dyn Runtime>,
     ) -> Self {
+        Self::new_with_runtime_and_caps_for_test(model, root, runtime, Capabilities::default())
+    }
+
+    /// 测试辅助（仅测试构建）：注入自定义 Runtime 与 Capabilities。
+    ///
+    /// 供 agent.rs 测试验证权限门：被拒工具不应触碰注入的 Runtime。
+    #[cfg(test)]
+    pub(crate) fn new_with_runtime_and_caps_for_test(
+        model: M,
+        root: PathBuf,
+        runtime: Box<dyn Runtime>,
+        capabilities: Capabilities,
+    ) -> Self {
         Self {
             model,
             root,
             runtime,
+            capabilities,
         }
     }
 
@@ -139,12 +171,25 @@ impl<M: Model> Agent<M> {
 
                     conversation.push(Message::assistant_tool_calls(calls.clone()));
                     for call in calls {
-                        let result = match Tool::from_call(&call.name, &call.arguments) {
-                            Ok(tool) => match tool.execute(self.runtime.as_ref(), &self.root) {
-                                Ok(text) => text,
+                        // 能力门：执行前检查，被拒时不触碰 Runtime，
+                        // 拒绝作为 Tool Result 回传给 Model（与工具错误同一语义）。
+                        let result = if !self.capabilities.allows(&call.name) {
+                            let capability = self
+                                .capabilities
+                                .denied_capability_name(&call.name)
+                                .unwrap_or("unknown");
+                            format!(
+                                "tool error: permission denied: {} requires {capability} capability",
+                                call.name
+                            )
+                        } else {
+                            match Tool::from_call(&call.name, &call.arguments) {
+                                Ok(tool) => match tool.execute(self.runtime.as_ref(), &self.root) {
+                                    Ok(text) => text,
+                                    Err(err) => format!("tool error: {err}"),
+                                },
                                 Err(err) => format!("tool error: {err}"),
-                            },
-                            Err(err) => format!("tool error: {err}"),
+                            }
                         };
                         conversation.push(Message::tool(result, call.id));
                     }
@@ -190,6 +235,7 @@ mod tests {
             model,
             root,
             runtime: Box::new(LocalRuntime),
+            capabilities: Capabilities::default(),
         }
     }
 
@@ -584,5 +630,165 @@ mod tests {
             "got: {}",
             calls[0]
         );
+    }
+
+    /// 只读能力下：write_file 被拒——tool result 含 permission denied，
+    /// 且 FakeRuntime 调用日志中没有 write_file（副作用确实被门拦住）。
+    #[test]
+    fn read_only_caps_blocks_write_before_runtime() {
+        let root = temp_root();
+        let model = FakeModel::new(vec![
+            Response::ToolCall(vec![tool_call(
+                "call_1",
+                "write_file",
+                serde_json::json!({ "path": "out.txt", "content": "data" }),
+            )]),
+            Response::Text("understood".to_string()),
+        ]);
+        let runtime = FakeRuntime::new();
+        let log = runtime.log();
+        let agent = Agent::new_with_runtime_and_caps_for_test(
+            model,
+            root,
+            Box::new(runtime),
+            Capabilities::read_only(),
+        );
+
+        let mut conversation = Vec::new();
+        agent
+            .run_turn(&mut conversation, "write a file")
+            .unwrap();
+
+        // (a) 返回给模型的 tool result 含 permission denied
+        let tool_msg = &conversation[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert!(
+            tool_msg
+                .content
+                .contains("permission denied"),
+            "got: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("write_file")
+                && tool_msg.content.contains("filesystem_write"),
+            "got: {}",
+            tool_msg.content
+        );
+        // (b) FakeRuntime 未被触碰：日志中没有任何 write_file 调用
+        assert!(
+            log.borrow().is_empty(),
+            "runtime should not be touched, got: {:?}",
+            log.borrow()
+        );
+    }
+
+    /// 只读能力下：read_file 仍正常经由 FakeRuntime 执行。
+    #[test]
+    fn read_only_caps_still_allows_read_file() {
+        let root = temp_root();
+        // read_file 的路径解析（resolve_within）要求目标文件真实存在，
+        // 故先在临时目录写入真实文件；读取仍经由 FakeRuntime（脚本化内容）。
+        fs::write(root.join("note.txt"), "real content").unwrap();
+        let model = FakeModel::new(vec![
+            Response::ToolCall(vec![tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({ "path": "note.txt" }),
+            )]),
+            Response::Text("got it".to_string()),
+        ]);
+        let runtime = FakeRuntime::new().with_file("note.txt", "scripted content");
+        let log = runtime.log();
+        let agent = Agent::new_with_runtime_and_caps_for_test(
+            model,
+            root,
+            Box::new(runtime),
+            Capabilities::read_only(),
+        );
+
+        let mut conversation = Vec::new();
+        agent
+            .run_turn(&mut conversation, "read the note")
+            .unwrap();
+
+        assert_eq!(conversation[2].content, "scripted content");
+        let calls = log.borrow();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        assert!(calls[0].starts_with("read_file:"), "got: {}", calls[0]);
+    }
+
+    /// 只读能力下：exec 被拒，且 FakeRuntime 日志中没有 exec。
+    #[test]
+    fn read_only_caps_blocks_exec_before_runtime() {
+        let root = temp_root();
+        let model = FakeModel::new(vec![
+            Response::ToolCall(vec![tool_call(
+                "call_1",
+                "exec",
+                serde_json::json!({ "command": "cargo check" }),
+            )]),
+            Response::Text("can't run that".to_string()),
+        ]);
+        let runtime = FakeRuntime::new();
+        let log = runtime.log();
+        let agent = Agent::new_with_runtime_and_caps_for_test(
+            model,
+            root,
+            Box::new(runtime),
+            Capabilities::read_only(),
+        );
+
+        let mut conversation = Vec::new();
+        agent
+            .run_turn(&mut conversation, "run cargo check")
+            .unwrap();
+
+        let tool_msg = &conversation[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert!(
+            tool_msg
+                .content
+                .contains("permission denied")
+                && tool_msg.content.contains("process_execute"),
+            "got: {}",
+            tool_msg.content
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "runtime should not be touched, got: {:?}",
+            log.borrow()
+        );
+    }
+
+    /// 全允许（Default）能力下：write_file 正常执行，日志中有 write_file。
+    #[test]
+    fn full_caps_executes_write_file() {
+        let root = temp_root();
+        let model = FakeModel::new(vec![
+            Response::ToolCall(vec![tool_call(
+                "call_1",
+                "write_file",
+                serde_json::json!({ "path": "out.txt", "content": "data" }),
+            )]),
+            Response::Text("done".to_string()),
+        ]);
+        let runtime = FakeRuntime::new();
+        let log = runtime.log();
+        let agent = Agent::new_with_runtime_and_caps_for_test(
+            model,
+            root,
+            Box::new(runtime),
+            Capabilities::default(),
+        );
+
+        let mut conversation = Vec::new();
+        agent
+            .run_turn(&mut conversation, "write a file")
+            .unwrap();
+
+        let calls = log.borrow();
+        assert_eq!(calls.len(), 1, "unexpected calls: {calls:?}");
+        assert!(calls[0].starts_with("write_file:"), "got: {}", calls[0]);
     }
 }

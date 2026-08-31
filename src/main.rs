@@ -1,4 +1,5 @@
 mod agent;
+mod capabilities;
 mod message;
 mod model;
 mod nix_runtime;
@@ -7,6 +8,7 @@ mod session;
 mod tool;
 
 use crate::agent::Agent;
+use crate::capabilities::Capabilities;
 use crate::model::OpenAICompatibleModel;
 use crate::runtime::{LocalRuntime, Runtime};
 use crate::session::Session;
@@ -49,6 +51,16 @@ fn build_runtime() -> Result<Box<dyn Runtime>, String> {
     }
 }
 
+/// 只读模式：`MYAGENT_READ_ONLY` 取值为 `1` / `true`（大小写不敏感）时启用。
+///
+/// 其余取值（含未设置、非法取值）一律按“非只读”处理，保持默认行为零变化。
+fn read_only_mode() -> bool {
+    match env::var("MYAGENT_READ_ONLY") {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Err(_) => false,
+    }
+}
+
 fn main() {
     let api_key = match env::var("OPENAI_API_KEY") {
         Ok(key) => key,
@@ -69,13 +81,27 @@ fn main() {
         }
     };
 
-    let agent = match Agent::new_with_runtime(model, runtime) {
+    // 能力选择：MYAGENT_READ_ONLY=1/true → 只读模式，否则全允许（行为零变化）。
+    let read_only = read_only_mode();
+    let capabilities = if read_only {
+        Capabilities::read_only()
+    } else {
+        Capabilities::default()
+    };
+
+    let agent = match Agent::new_with_runtime_and_caps(model, runtime, capabilities) {
         Ok(agent) => agent,
         Err(err) => {
             eprintln!("failed to initialize agent: {err}");
             std::process::exit(1);
         }
     };
+
+    // 启动横幅：当前能力模式，便于用户确认（与 MYAGENT_RUNTIME 正交可组合）。
+    eprintln!(
+        "capabilities: {}",
+        if read_only { "read-only" } else { "full" }
+    );
 
     // 启动时恢复已有 conversation（文件不存在则从空对话开始）
     let path = session_path();

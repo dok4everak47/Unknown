@@ -1,8 +1,9 @@
 # Runtime 设计文档
 
-> 状态：**§5 条件 2 已触发；`Runtime` trait 与 `NixRuntime` 已落地（2026-08-31）**
-> 关联：AGENTS.md、README TODO（Sandbox / Capability system 未实现）
-> §6 方案 B 草案与实际实现的差异见文末 §8「已落地形态」
+> 状态：**§5 条件 2 已触发；`Runtime` trait 与 `NixRuntime` 已落地（2026-08-31）；
+>       §5 条件 3 已触发；`Capabilities` 权限门已落地（2026-08-31，见 §9）**
+> 关联：AGENTS.md、README TODO（Sandbox 未实现）
+> §6 方案 B / 方案 C 草案与实际实现的差异见文末 §8 / §9「已落地形态」
 
 ---
 
@@ -364,13 +365,12 @@ impl Default for Capabilities {
 
 ## 7. 当前明确不做
 
-已落地：`Runtime` trait（§5 条件 2）与 `NixRuntime`（见 §8）。以下仍**未实现**，
-且当前**无需求**，不要提前引入：
+已落地：`Runtime` trait（§5 条件 2，见 §8）、`NixRuntime`（§8）、`Capabilities`
+权限门（§5 条件 3，见 §9）。以下仍**未实现**，且当前**无需求**，不要提前引入：
 
 - **RuntimeContext struct** —— 无可变超时/可控 env 需求（§5 条件 1 未触发；
   当前两个实现硬编码 60s 超时、继承 env）
 - **Sandbox** —— 模型可信 + 白名单已是最小权限，无防御需求（§3）
-- **Capability system** —— 无权限分化场景（§5 条件 3 未触发）
 - **Container** —— 无远程/隔离执行需求
 
 **判据**：上述任何一项，只有当 §5 的对应条件出现时才值得实现。
@@ -394,5 +394,44 @@ impl Default for Capabilities {
 - `flake.nix` `shellHook` 横幅改为仅交互式 tty 打印，避免污染
   `nix develop --command` 的输出。
 
-仍未实现（后续方向）：Sandbox、Capability system、Container、RuntimeContext
-（timeout / env 可配）。
+仍未实现（后续方向）：Sandbox、Container、RuntimeContext（timeout / env 可配）。
+Capability-based execution 已落地（见 §9）。
+
+## 9. Capabilities 已落地形态（2026-08-31）
+
+§5 条件 3 已触发：需要支持“只读 / 受限模式”——同一 Agent 可被配置为只能读。
+实际落地的是 §6 方案 C 的最小形态：
+
+- `Capabilities`（`src/capabilities.rs`）：三个布尔字段 `filesystem_read` /
+  `filesystem_write` / `process_execute`，`Default` 全允许（行为零变化），
+  `Capabilities::read_only()` 为只读模式（read=true，write/execute=false）。
+- 工具名 → 所需能力的映射（纯函数 `required_capability`）：
+  `read_file` / `search` → `filesystem_read`；`write_file` / `edit_file` →
+  `filesystem_write`；`exec` → `process_execute`；未知名返回 `None`（不拦截，
+  交给 `Tool::from_call` 的未知工具错误路径）。
+- 判定 `Capabilities::allows(tool_name) -> bool`（无能力要求的工具名返回 `true`）
+  与 `denied_capability_name(tool_name) -> Option<&'static str>`（构造拒绝消息）。
+- `Agent` 新增 `capabilities: Capabilities` 字段；`new_with_runtime` 签名不变
+  （内部委托 `new_with_runtime_and_caps` + `Default`），新增
+  `new_with_runtime_and_caps(model, runtime, caps)` 公开构造器。
+
+**与 §6 方案 C 草案的差异**：草案假设能力门依赖 Stage 2 的 `Executor`（“依赖
+E 才有意义”）。实际落地**没有引入 Executor**——门是纯布尔检查，放在
+`Agent::run_turn` 的工具分发处（`Tool::from_call` 成功之后、`tool.execute` 之前）：
+
+```text
+Model → Response::ToolCall → Agent
+  ↓ allows(&call.name)？
+  ├─ 否 → 拒绝作为 Tool Result 回传（不触碰 Runtime）
+  └─ 是 → Tool::from_call → tool.execute(Runtime) → Filesystem
+```
+
+被拒时回传的消息复用现有工具错误格式：
+`tool error: permission denied: write_file requires filesystem_write capability`，
+与“工具错误回传模型不中止循环”的语义一致。能力门是执行前的一道布尔检查，
+未引入权限继承、角色或策略引擎，也未修改 `Runtime` trait。
+
+CLI 用 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
+`1` / `true`（大小写不敏感）→ `Capabilities::read_only()`；其余 / 未设置 →
+`Capabilities::default()`（全允许）。启动时在 stderr 打印一行当前模式
+（`capabilities: full` / `capabilities: read-only`）便于确认。

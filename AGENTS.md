@@ -46,6 +46,7 @@ src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider
 src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
+src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
 src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
 src/session.rs   conversation 持久化（Session::load / Session::save）
@@ -65,6 +66,11 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
   在 flake.nix 声明的可复现 devShell 中执行（不改变文件语义）。
 
 CLI 通过 `MYAGENT_RUNTIME` 环境变量选择：`local`（默认）/ `nix`（构造时验证 nix 可用）。
+
+权限分化由 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
+取值为 `1` / `true`（大小写不敏感）时启用只读模式——`write_file` / `edit_file`
+与 `exec` 在工具分发处被能力门拦下，拒绝作为 Tool Result 回传 Model，不触碰 Runtime；
+其余取值 / 未设置一律按“全允许”处理，默认行为零变化。
 
 ## Principles
 
@@ -455,6 +461,7 @@ exec（受控开发命令，白名单）
 session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
+Capability-based execution（Capabilities 权限门，MYAGENT_READ_ONLY=1/true 只读模式）
 ```
 
 不要自动实现 roadmap 中的功能。每一步只做被明确要求的、最小的一步。
