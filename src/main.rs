@@ -157,7 +157,14 @@ fn main() {
                     eprintln!("failed to save session: {err}");
                 }
             }
-            Err(err) => eprintln!("error: {err}"),
+            Err(err) => {
+                eprintln!("error: {err}");
+                let mut source = std::error::Error::source(&err);
+                while let Some(cause) = source {
+                    eprintln!("  caused by: {cause}");
+                    source = cause.source();
+                }
+            }
         }
     }
 }
