@@ -1,14 +1,13 @@
-# Autoresearch Prompt: reduce `cargo check` latency
+# Autoresearch Prompt: reduce release binary size
 
-- Status: **ready, not started**
+- Status: **finalized 2026-08-31 — binary_kb 5852 → 1980 KB (-66.2%); review by Codex, merged via squash finalize**
 - Created: 2026-08-31
 - Owner: Pi autoresearch
 - Reviewer: Codex
-- Primary metric: `check_seconds`（lower is better）
+- Primary metric: `binary_kb`（lower is better）
 
-> 这是第一次 autoresearch 会话建议。默认目标选择 `cargo check` 耗时，因为 `.auto/measure.sh` 的默认 workload 就是 `check`，且它是当前增量开发中最常运行的反馈命令。
->
-> 如果要改为优化 `cargo test`、`cargo build --release` 或 binary size，必须先修改本文件的 Goal / Metric，再开始实验。
+> 原目标 `check_seconds` 已在实验 #5 确认到达硬性下限（0.09-0.11s = cargo floor 0.04s + active-graph metadata scan 0.05s；对源码大小、fingerprint 数量、-j、incremental 均不变）。
+> 按本文件规定的切换流程，现改为优化 **release 二进制体积** `binary_kb`（`WORKLOAD=size .auto/measure.sh`）。
 
 ---
 
@@ -17,12 +16,12 @@
 在不改变 Agent 行为、不新增功能、不新增依赖、不扩大架构范围的前提下，降低：
 
 ```bash
-WORKLOAD=check .auto/measure.sh
+WORKLOAD=size .auto/measure.sh
 ```
 
-报告的 `check_seconds`。
+报告的 `binary_kb`（`du -sk target/release/myagent`）。
 
-优化对象是当前 Rust 项目的 **check 反馈延迟**。实验可以做小规模代码组织或编译配置调整，但必须保持所有用户可见行为不变。
+优化对象是当前 Rust 项目的 **release 二进制体积**。实验只允许做编译配置（`[profile.release]` 等）或行为保持的代码调整，必须保持所有用户可见行为不变。
 
 ## Non-goals
 
@@ -48,14 +47,16 @@ WORKLOAD=check .auto/measure.sh
 ### Primary metric
 
 ```text
-check_seconds
+binary_kb
 ```
 
 由以下命令输出：
 
 ```bash
-WORKLOAD=check .auto/measure.sh
+WORKLOAD=size .auto/measure.sh
 ```
+
+（需要先 `WORKLOAD=build .auto/measure.sh` 生成 release 二进制；该命令同时报告 `build_seconds` 作为副观测。）
 
 方向：**lower is better**。
 
@@ -82,9 +83,9 @@ cargo test --quiet
 
 可观察但不得替代 primary metric：
 
+- `WORKLOAD=build .auto/measure.sh` → `build_seconds`（release 构建时间，LTO/opt 配置会使其上升，需权衡）
 - `WORKLOAD=test .auto/measure.sh` → `test_seconds`
-- `WORKLOAD=build .auto/measure.sh` → `build_seconds`
-- `WORKLOAD=size .auto/measure.sh` → `binary_kb`
+- `WORKLOAD=check .auto/measure.sh` → `check_seconds`（已到达下限，仅作回归监测）
 
 只有 primary metric 改善且 checks 全部通过，才允许保留实验。
 
@@ -99,7 +100,7 @@ cargo test --quiet
 
 ## Baseline
 
-尚未测量。
+新目标的 baseline 尚未测量（旧目标 check_seconds 的 baseline/结果见下方 Tried experiments 与 .auto/log.jsonl）。
 
 开始实验前第一步：
 
@@ -107,10 +108,10 @@ cargo test --quiet
 2. 运行：
 
    ```bash
-   WORKLOAD=check .auto/measure.sh
+   WORKLOAD=build .auto/measure.sh
    ```
 
-3. 记录 baseline `check_seconds`。
+3. 记录 baseline `binary_kb`（与 `build_seconds`）。
 4. 运行：
 
    ```bash
@@ -210,24 +211,25 @@ Hypothesis → change one thing → measure → checks → keep/discard → log
 这些只是候选假设，不代表必须执行：
 
 1. **先测量，不猜测**
-   - 记录 baseline。
-   - 连续运行几次 `WORKLOAD=check .auto/measure.sh`，观察 warm/cold 波动。
+   - 记录 release baseline。
+   - 检查二进制内部构成（`cargo bloat` / `llvm-size` 如可用），确认大头（aws-lc BoringSSL、hyper、tokio、rustls、serde_json、我们的代码）。
 
-2. **审查现有依赖 features**
-   - 当前只有 `reqwest`、`serde`、`serde_json`。
-   - 可评估 `reqwest` 默认 features 是否包含当前 OpenAI-compatible blocking JSON client 不需要的能力。
-   - 风险：HTTPS / TLS / HTTP client 行为可能受影响；必须通过 mock-HTTP 集成测试和真实构建检查。
+2. **`[profile.release]` 体积配置**（行为保持，首选）
+   - `strip = true`（去掉符号表，直接减小磁盘体积）
+   - `opt-level = "z"`（以体积为目标的代码生成，替换默认 opt-level=3）
+   - `lto = true`（fat LTO，跨 crate 消除死代码；build_seconds 会上升）
+   - `codegen-units = 1`（配合 LTO 效果最佳）
+   - 注意：`panic = "abort"` 会改变 release 行为（abort vs unwind），且可能影响 `cargo test`，默认不做，除非确认行为等价。
 
-3. **审查 dev profile 编译配置**
-   - 只考虑对 `cargo check` 有实际影响且不损害开发体验的配置。
-   - 不允许为了指标牺牲正确性或调试能力。
+3. **审查现有依赖 features**
+   - 已完成的 reqwest 裁剪（exp #3，drop h2/encoding_rs 等）同时缩小了二进制。
+   - 可评估是否还有可安全关闭的 feature。
 
-4. **审查模块组织**
-   - 若存在大型模块导致无效重编译，可考虑最小拆分。
-   - 但不要为了“看起来更架构化”而抽象 Runtime / Executor。
+4. **`#[cfg(test)]` 死代码**
+   - 确认测试专用代码不进 release 二进制（通常由 cfg 保证；验证即可）。
 
-5. **避免测试代码影响普通 check 的误判**
-   - `cargo check` 与 `cargo test` 的编译目标不同；不要把 test-only 慢编译误判为普通 check 慢。
+5. **避免把 build_seconds 上升误判为失败**
+   - LTO / opt-level=z 会显著增加 release 构建时间；binary_kb 是 primary，build_seconds 是权衡项。
 
 ---
 
@@ -254,6 +256,18 @@ Hypothesis → change one thing → measure → checks → keep/discard → log
 ---
 
 ## Tried experiments
+
+### check_seconds 会话（已结束，到达下限）
+
+| ID | Hypothesis | Files changed | Before | After | Result | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| #1 | Baseline check_seconds | — | 0.144s | — | keep | warm no-op check |
+| #2 | Noise probe | — | 0.144s | 0.120s | keep | ~0.02s run-to-run variance |
+| #3 | Trim reqwest features (drop h2/encoding_rs/etc.) | Cargo.toml, Cargo.lock | 0.144s | 0.108s | keep | dep graph 165 pkgs; only real lever |
+| #4 | Stability confirmation | — | 0.108s | 0.108s | keep | src size irrelevant to metric |
+| #5 | Floor conclusion (clean rebuild 423→131 fps) | — | 0.108s | 0.116s | keep | floor = cargo 0.04s + graph scan 0.05s |
+
+### binary_kb 会话（当前）
 
 | ID | Hypothesis | Files changed | Before | After | Result | Notes |
 | --- | --- | --- | --- | --- | --- | --- |

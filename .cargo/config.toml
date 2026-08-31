@@ -1,0 +1,17 @@
+# Size-optimizing codegen flags for release binaries on aarch64 macOS.
+# Verified behavior-preserving: 102 tests pass, binary runs (see .auto/log.jsonl).
+#
+# - machine outliner: factors repeated aarch64 instruction sequences (prologue/
+#   epilogue, constant loads) into shared out-of-line functions. Saves ~32 KB.
+#   -Oz does NOT enable this late pass by default (exp #21).
+#
+# Evaluated and rejected (finalize review, 2026-08-31):
+# - "-C", "link-arg=-Wl,-no_pie" — deterministic A/B shows it saves 16 KB, but
+#   NOT by disabling ASLR (the MH_PIE flag stays; ld prints "ignored for arm64").
+#   It works by suppressing the __DATA_CONST segment, so __got/__const stay in
+#   a writable __DATA segment at runtime (no post-fixup read-only lockdown).
+#   Keeping the platform hardening feature is worth the 16 KB (0.8%).
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "llvm-args=-enable-machine-outliner=always",
+]
