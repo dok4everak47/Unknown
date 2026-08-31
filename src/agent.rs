@@ -8,7 +8,12 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// 单次用户输入最多允许的模型↔工具交互轮数，防止模型陷入循环。
-const MAX_TOOL_ROUNDS: usize = 8;
+/// 单次用户输入允许的最大工具调用轮数。
+///
+/// 一轮 = 模型一次返回的工具调用（可含多个并行调用）。部分模型习惯逐次
+/// 发起调用，且工具被拒绝/失败后的重试也消耗轮数；真实任务（如脚手架
+/// + 校验 + 修错）需要约 10+ 轮，故取 16。
+const MAX_TOOL_ROUNDS: usize = 16;
 
 /// Agent Loop 的致命错误。
 ///
@@ -27,7 +32,10 @@ impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentError::TooManyToolRounds => {
-                write!(f, "too many tool-call rounds, giving up")
+                write!(
+                    f,
+                    "too many tool-call rounds ({MAX_TOOL_ROUNDS}); task left unfinished — files created so far remain on disk, ask me to continue or break the task into smaller steps"
+                )
             }
             AgentError::Model(err) => write!(f, "{err}"),
         }
