@@ -50,6 +50,7 @@ src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exe
 src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
 src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
+src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 macOS Seatbelt 沙箱（/usr/bin/sandbox-exec + SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 控制），文件操作委托内层 runtime
 src/session.rs   conversation 持久化（Session::load / Session::save）
 ```
 
@@ -67,6 +68,14 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
   在 flake.nix 声明的可复现 devShell 中执行（不改变文件语义）。
 
 CLI 通过 `MYAGENT_RUNTIME` 环境变量选择：`local`（默认）/ `nix`（构造时验证 nix 可用）。
+
+再外层是可选装饰器 `SandboxedRuntime`（`MYAGENT_SANDBOX=1/true` 启用，**默认关**）：
+`exec` 被包装为 `sandbox-exec -p <policy> <cmd>`，把 cargo 及其衍生的 build.rs /
+proc-macro / 测试二进制放进 macOS Seatbelt 沙箱；文件操作仍直接委托内层 runtime。
+`MYAGENT_SANDBOX_NETWORK=1/true` 显式放行沙箱内网络（默认关，不随
+`MYAGENT_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec` 不存在
+→ 构造失败、清晰报错并退出，**绝不静默降级为不隔离**。与 `MYAGENT_RUNTIME`（local /
+nix）、`MYAGENT_READ_ONLY` 三方正交可组合。
 
 权限分化由 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
 取值为 `1` / `true`（大小写不敏感）时启用只读模式——`write_file` / `edit_file`
@@ -353,7 +362,7 @@ Waiting for approval.
 - [x] exec
 - [x] Runtime abstraction
 - [x] Nix Runtime
-- [ ] Sandbox
+- [x] Sandbox（Seatbelt 真实隔离，MYAGENT_SANDBOX）
 ```
 
 ### Workflow
@@ -464,6 +473,7 @@ session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
 Capability-based execution（Capabilities 权限门，MYAGENT_READ_ONLY=1/true 只读模式）
+Sandbox（SandboxedRuntime 装饰器：exec 经 sandbox-exec 放进 macOS Seatbelt 沙箱，MYAGENT_SANDBOX=1/true 启用，MYAGENT_SANDBOX_NETWORK=1/true 放行网络；文件操作委托内层 runtime）
 .env 配置文件（工作目录 .env 自动加载，环境变量优先；模板见 .env.example）
 ```
 
@@ -506,7 +516,8 @@ Capabilities
 Sandbox
 ```
 
-没有明确任务时不要提前实现这些。
+`Nix`（Development Environment）、`Runtime` 抽象、`Capabilities` 权限门与
+`Sandbox`（Seatbelt）均已实现（见 Current Scope）。没有明确任务时不要提前实现这些之外的下一步。
 
 ## Verification
 

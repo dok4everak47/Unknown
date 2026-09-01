@@ -5,6 +5,7 @@ mod message;
 mod model;
 mod nix_runtime;
 mod runtime;
+mod sandbox;
 mod session;
 mod tool;
 
@@ -61,6 +62,24 @@ fn read_only_mode() -> bool {
     }
 }
 
+/// 沙箱开关：`MYAGENT_SANDBOX` 取值为 `1` / `true`（大小写不敏感）时启用，
+/// **默认关**。与 `MYAGENT_RUNTIME`、`MYAGENT_READ_ONLY` 正交可组合。
+fn sandbox_mode() -> bool {
+    match env::var("MYAGENT_SANDBOX") {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Err(_) => false,
+    }
+}
+
+/// 沙箱内放开网络：`MYAGENT_SANDBOX_NETWORK` 取值为 `1` / `true` 时启用，
+/// **默认关**，不随 `MYAGENT_SANDBOX=1` 隐式开启（用户侧显式 opt-in）。
+fn sandbox_network() -> bool {
+    match env::var("MYAGENT_SANDBOX_NETWORK") {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Err(_) => false,
+    }
+}
+
 fn main() {
     // 先加载 .env（工作目录）；真实环境变量优先，.env 仅兜底。
     if let Err(err) = config::load_dotenv(std::path::Path::new(".env")) {
@@ -86,6 +105,33 @@ fn main() {
         }
     };
 
+    // Sandbox 装饰（在 runtime 选择之后、最外层包装）：MYAGENT_SANDBOX=1/true
+    // 时，exec 经 sandbox-exec 放进 Seatbelt 沙箱；文件操作仍委托内层 runtime。
+    // 启用时若非 macOS 或 sandbox-exec 不可用 → 构造失败、清晰报错并退出，
+    // 绝不静默降级为不隔离。与 Capabilities（MYAGENT_READ_ONLY）正交。
+    let sandbox = sandbox_mode();
+    let runtime = if sandbox {
+        let network = sandbox_network();
+        let root = match std::env::current_dir() {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!("failed to resolve working directory: {err}");
+                std::process::exit(1);
+            }
+        };
+        match crate::sandbox::SandboxedRuntime::new(&root, network, runtime) {
+            Ok(runtime) => Box::new(runtime),
+            Err(err) => {
+                eprintln!(
+                    "MYAGENT_SANDBOX=1 but failed to enable sandbox: {err}\n  Seatbelt sandbox requires macOS with /usr/bin/sandbox-exec"
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        runtime
+    };
+
     // 能力选择：MYAGENT_READ_ONLY=1/true → 只读模式，否则全允许（行为零变化）。
     let read_only = read_only_mode();
     let capabilities = if read_only {
@@ -107,6 +153,14 @@ fn main() {
         "capabilities: {}",
         if read_only { "read-only" } else { "full" }
     );
+
+    // 启动横幅：沙箱实际状态（启用时打印；与 MYAGENT_READ_ONLY 正交可组合）。
+    if sandbox {
+        eprintln!(
+            "sandbox: on (network: {})",
+            if sandbox_network() { "ON" } else { "off" }
+        );
+    }
 
     // 启动时恢复已有 conversation（文件不存在则从空对话开始）
     let path = session_path();

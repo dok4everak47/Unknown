@@ -1,8 +1,8 @@
 # Sandbox 设计文档
 
-> 状态：**设计草案，未实现**（2026-09-01）
-> 关联：AGENTS.md（roadmap 最后一项 Sandbox）、[runtime-design.md](runtime-design.md)（Runtime trait / Capabilities 已落地）
-> 本文只做威胁模型分析与方案设计，**不修改任何 src 代码**。实现需用户明确授权。
+> 状态：**已实现**（2026-09-01，`src/sandbox.rs`，`MYAGENT_SANDBOX=1/true` 启用）
+> 关联：AGENTS.md（roadmap Sandbox）、[runtime-design.md](runtime-design.md)（§10 已落地形态）
+> 本文记录威胁模型、方案设计与验收清单；实现细节见 `src/sandbox.rs` 与 §9。
 
 ---
 
@@ -195,18 +195,25 @@ MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉�
 > `sandbox_apply: Operation not permitted`；第 2/3/4 项测试需在普通
 > 用户终端运行（CI 为 macOS 时同样适用）。
 
-## 8. 验收标准
+## 8. 验收标准（2026-09-01 全部通过）
 
-- [ ] §4.2 的 6 种写攻击（含 symlink/rename/unlink/hardlink）全部被拒；
-- [ ] 恶意 build.rs 的越界写、外联全部失败，攻击产物不存在；
-- [ ] 无害 build.rs 对照组在沙箱内 `cargo build` 成功；
-- [ ] 默认策略衍生进程无法联网；`MYAGENT_SANDBOX_NETWORK=1` opt-in 后可以；
-- [ ] 横幅正确显示 sandbox 与 network 状态；
-- [ ] 沙箱内对本项目 `cargo check/build/test` 正常通过（策略不误伤）；
-- [ ] 非 macOS / 无 sandbox-exec 时构造失败并给清晰错误，不静默降级；
-- [ ] 文件工具行为不受影响（装饰器委托内层）；全部既有测试通过。
+- [x] §4.2 的 6 种写攻击（含 symlink/rename/unlink/hardlink）全部被拒
+  （`attack_matrix_blocks_all_write_escapes`，真实 sandbox-exec）；
+- [x] 恶意 build.rs 的越界写、外联全部失败，攻击产物不存在
+  （`malicious_build_rs_is_confined_and_harmless_control_succeeds`）；
+- [x] 无害 build.rs 对照组在沙箱内 `cargo build` 成功（同一测试）；
+- [x] 默认策略衍生进程无法联网；`MYAGENT_SANDBOX_NETWORK=1` opt-in 后可以
+  （`network_denied_by_default_and_opt_in_connects`）；
+- [x] 横幅正确显示 sandbox 与 network 状态（`sandbox: on (network: off/ON)`，
+  真实 CLI 冒烟验证）；
+- [x] 沙箱内对本项目 `cargo check/build/test` 正常通过（策略不误伤：CLI 冒烟
+  `cargo check` exit 0 + 集成测试内 `cargo build`）；
+- [x] 非 macOS / 无 sandbox-exec 时构造失败并给清晰错误，不静默降级
+  （`SandboxedRuntime::new` 的 `cfg` + 存在性检查返回 `io::Error`；gated 测试
+  在沙箱不可用时跳过而非静默降级）；
+- [x] 文件工具行为不受影响（装饰器委托内层）；全部既有测试通过（133 passed）。
 
-## 9. 实现形态预览（待授权，不在本轮）
+## 9. 实现形态（2026-09-01 已落地）
 
 ```text
 src/sandbox.rs        SandboxedRuntime { inner: Box<dyn Runtime> }
@@ -216,4 +223,5 @@ src/main.rs           MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 解析，
                       按标志包装 runtime（在 runtime 选择之后）
 ```
 
-预计 diff 规模与 NixRuntime 相当（~150-200 行 + 测试），无新依赖。
+与草案一致，无新依赖；测试见 §7（9 单测 + 3 个 gated 集成测试，运行时自动探测
+sandbox-exec 真实可用才执行，无环境变量开关；嵌套沙箱环境自动跳过）。

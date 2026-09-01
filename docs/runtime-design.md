@@ -1,8 +1,9 @@
 # Runtime 设计文档
 
 > 状态：**§5 条件 2 已触发；`Runtime` trait 与 `NixRuntime` 已落地（2026-08-31）；
->       §5 条件 3 已触发；`Capabilities` 权限门已落地（2026-08-31，见 §9）**
-> 关联：AGENTS.md、README TODO（Sandbox 未实现）
+>       §5 条件 3 已触发；`Capabilities` 权限门已落地（2026-08-31，见 §9）；
+>       Sandbox（Seatbelt 装饰器）已落地（2026-09-01，见 §10）**
+> 关联：AGENTS.md、README TODO、docs/sandbox-design.md
 > §6 方案 B / 方案 C 草案与实际实现的差异见文末 §8 / §9「已落地形态」
 
 ---
@@ -366,12 +367,13 @@ impl Default for Capabilities {
 ## 7. 当前明确不做
 
 已落地：`Runtime` trait（§5 条件 2，见 §8）、`NixRuntime`（§8）、`Capabilities`
-权限门（§5 条件 3，见 §9）。以下仍**未实现**，且当前**无需求**，不要提前引入：
+权限门（§5 条件 3，见 §9）、`Sandbox`（Seatbelt 装饰器，见 §10）。以下仍
+**未实现**，且当前**无需求**，不要提前引入：
 
 - **RuntimeContext struct** —— 无可变超时/可控 env 需求（§5 条件 1 未触发；
-  当前两个实现硬编码 60s 超时、继承 env）
-- **Sandbox** —— 模型可信 + 白名单已是最小权限，无防御需求（§3）
-- **Container** —— 无远程/隔离执行需求
+  当前实现硬编码 60s 超时、继承 env）
+- **Container / remote executor** —— 无远程/隔离执行需求
+- **exec 白名单扩展** —— 有明确需求再议，需与 nix develop / sandbox 语义配合
 
 **判据**：上述任何一项，只有当 §5 的对应条件出现时才值得实现。
 
@@ -435,3 +437,34 @@ CLI 用 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
 `1` / `true`（大小写不敏感）→ `Capabilities::read_only()`；其余 / 未设置 →
 `Capabilities::default()`（全允许）。启动时在 stderr 打印一行当前模式
 （`capabilities: full` / `capabilities: read-only`）便于确认。
+
+## 10. Sandbox 已落地形态（2026-09-01）
+
+`Sandbox` 从“§7 明确不做”转为落地：需求触发点是**让 exec 的衍生进程（cargo →
+build.rs / proc-macro / 测试二进制）获得 OS 层真实隔离**，作为能力门之上的
+第二道防御（`docs/sandbox-design.md` 全文）。实现是一个**装饰器 runtime**，不是
+第四个 backend：
+
+- `SandboxedRuntime`（`src/sandbox.rs`）：持有内层 `Box<dyn Runtime>`；
+  `read_file` / `write_file` / `read_dir` 直接委托内层（文件操作语义零变化）；
+  `exec` 把命令包装为 `/usr/bin/sandbox-exec -p <policy> <cmd>`，放进 macOS
+  Seatbelt 沙箱。
+- SBPL 策略（`sandbox_policy` 纯函数）：`(version 1)` + `(allow default)`，
+  然后 `(deny network*)`（仅 network=off 时）、`(deny file-write*)`，最后
+  仅 allow 工作目录（ROOT）与 `TMPDIR` 两个 subpath 的写；
+  `MYAGENT_SANDBOX_NETWORK=1/true` 时不输出 deny network 行。
+  注意 SBPL 后匹配者生效，deny 必须在 allow 之前；ROOT/TMPDIR 注入前 canonicalize。
+- 构造安全：非 macOS 或 `/usr/bin/sandbox-exec` 不存在 →
+  `io::Error`（`io::Error::other` / `ErrorKind::NotFound`，清晰报错、CLI 退出），
+  **绝不静默降级为不隔离**。
+- CLI：`MYAGENT_SANDBOX=1/true` 启用（默认关）；与 `MYAGENT_RUNTIME`
+  （local/nix）、`MYAGENT_READ_ONLY` 三方正交可组合。启动时 stderr 打印
+  `sandbox: on (network: off)` / `sandbox: on (network: ON)`。
+- 测试：9 个单测（任何平台）+ 3 个 gated 集成测试（攻击矩阵 /
+  恶意 build.rs + 无害对照组 / 网络边界），gated 测试运行时自动探测
+  sandbox-exec 真实可用才执行，嵌套沙箱环境自动跳过（对齐 nix 冒烟测试
+  模式）；需在普通终端验证真实隔离。
+
+**与 §6 草案的差异**：草案（方案 B/C）没有装饰器形态；实际落地保持 `Runtime`
+trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 `tool.rs`、`agent.rs`
+零改动，且天然可与 NixRuntime、Capabilities 组合。

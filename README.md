@@ -14,9 +14,9 @@ Runtime
 Nix
 ```
 
-> ⚠️ 注意：`Sandbox` 目前**尚未实现**，只作为未来方向。`Capability-based execution`
-> （只读模式，`MYAGENT_READ_ONLY`）已实现；`Runtime` 抽象（工具副作用原语）与
-> `Nix Runtime` 也已实现，见下方代码结构。
+> `Capability-based execution`（只读模式，`MYAGENT_READ_ONLY`）、`Runtime` 抽象
+> （工具副作用原语）、`Nix Runtime` 与 `Sandbox`（`MYAGENT_SANDBOX`，Seatbelt）
+> 均已实现，见下方代码结构。
 
 ## 当前状态
 
@@ -35,6 +35,7 @@ Nix
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
 - [x] Nix Runtime（`NixRuntime`：exec 经 `nix develop --command` 落在可复现 devShell）
+- [x] Sandbox（`SandboxedRuntime` 装饰器：exec 经 `/usr/bin/sandbox-exec` 放进 macOS Seatbelt 沙箱，`MYAGENT_SANDBOX=1/true` 启用，`MYAGENT_SANDBOX_NETWORK=1/true` 放行网络；文件操作仍委托内层 runtime）
 - [x] Capability-based execution（`Capabilities` 权限门；`MYAGENT_READ_ONLY=1/true` 只读模式）
 - [x] Session persistence（conversation 保存/恢复，单 session）
 - [x] 基础路径边界校验（限制在工作目录内）
@@ -43,7 +44,6 @@ Nix
 
 尚未实现：
 
-- [ ] Sandbox
 - [ ] MCP
 - [ ] subagents
 
@@ -77,6 +77,7 @@ Final Response
 | `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command` |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
+| `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`MYAGENT_SANDBOX` / `MYAGENT_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
 | `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入，创建 Model / Agent，显示结果 |
@@ -99,6 +100,15 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 `MYAGENT_READ_ONLY` 控制：`1` / `true` 时为只读模式（`write_file` / `edit_file` /
 `exec` 被拒，拒绝作为 Tool Result 回传 Model，不触碰 `Runtime`），其余为全允许。
 `MYAGENT_READ_ONLY` 与 `MYAGENT_RUNTIME` 正交可组合，默认行为零变化。
+
+再外层是可选装饰器 `SandboxedRuntime`（`src/sandbox.rs`），CLI 用 `MYAGENT_SANDBOX`
+控制：`1` / `true` 时，`exec` 被包装为 `sandbox-exec -p <policy> <cmd>`，把 cargo 及其
+衍生的 `build.rs` / proc-macro / 测试二进制放进 macOS Seatbelt 沙箱（SBPL 策略先
+deny 全部写与网络，再仅放行工作目录与 `TMPDIR` 两个 subpath 的写）；文件操作仍直接
+委托内层 runtime。`MYAGENT_SANDBOX_NETWORK=1/true` 显式放行沙箱内网络（默认关，
+不会随 `MYAGENT_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec`
+不可用则构造失败、清晰报错并退出，绝不静默降级为不隔离。与 `MYAGENT_RUNTIME`（local /
+nix）、`MYAGENT_READ_ONLY` 三方正交可组合，默认行为零变化。
 
 ## Quick Start
 
@@ -136,10 +146,15 @@ export OPENAI_API_KEY="..."
 cargo run                 # 默认：exec 直接在当前环境执行（MYAGENT_RUNTIME=local），全能力
 MYAGENT_RUNTIME=nix cargo run   # exec 经 `nix develop --command` 在 devShell 中执行
 MYAGENT_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行命令（与 MYAGENT_RUNTIME 正交）
+MYAGENT_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认禁网
+MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
 ```
 
-启动时会在 stderr 打印一行当前能力模式（`capabilities: full` / `capabilities: read-only`），
-便于确认设置是否生效。
+启动时会在 stderr 打印当前能力模式（`capabilities: full` / `capabilities: read-only`）
+与沙箱状态（`sandbox: on (network: off)` / `sandbox: on (network: ON)`），便于确认设置是否生效。
+`MYAGENT_SANDBOX` 与 `MYAGENT_RUNTIME`、`MYAGENT_READ_ONLY` 正交可组合（例如
+`MYAGENT_SANDBOX=1 MYAGENT_RUNTIME=nix`：`sandbox-exec` 包裹 `nix develop --command`，
+策略对整个进程树生效）。
 
 示例对话：
 
@@ -187,25 +202,27 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 flake.nix 声明的可复现 devShell 中执行（文件操作仍走本地）。flake 的 `shellHook`
 横幅只在交互式 tty 下打印，不会污染 exec 工具的输出。
 
-它**不是** sandbox，也不代表完整 command execution。
+exec 本身仍不是完整 command execution（无 shell、白名单、60 秒超时）。
+当需要真实隔离时（`MYAGENT_SANDBOX=1`），exec 会被包装为
+`sandbox-exec -p <policy> <cmd>`：Seatbelt 在 OS 层约束 cargo 及其衍生的
+`build.rs` / proc-macro / 测试二进制的写入路径与网络（deny 全写/全网 → 仅放行工作目录
+与 `TMPDIR`；`MYAGENT_SANDBOX_NETWORK=1/true` 显式放行网络）。详细设计见
+[`docs/sandbox-design.md`](docs/sandbox-design.md)。
 
 ## Roadmap
-
-以下均为**未来方向**，尚未实现：
 
 ```text
 Tool system（扩展更多 typed tools）
     ↓
 Capability-based execution ✅（已实现：只读模式，MYAGENT_READ_ONLY）
     ↓
-Sandbox
+Sandbox ✅（已实现：Seatbelt 真实隔离，MYAGENT_SANDBOX）
 ```
 
-具体包括：
+尚未实现（未来方向）：
 
 - 更多工具
 - 更好的错误处理
 - sessions
 - MCP
 - subagents
-- 沙箱（Sandbox：在能力门之上的真实隔离）
