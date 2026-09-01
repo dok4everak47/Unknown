@@ -62,7 +62,10 @@ pub trait Runtime {
     /// 读文件为 UTF-8 文本（对应 `fs::read_to_string`）。
     fn read_file(&self, path: &Path) -> io::Result<String>;
 
-    /// 写文件（对应 `fs::write`，覆盖已存在文件；父目录必须已存在）。
+    /// 写文件（对应 `fs::write`，覆盖已存在文件）。
+    ///
+    /// 父目录不存在时自动创建（`fs::create_dir_all`），这样写入
+    /// `src/main.rs` 这类嵌套路径无需先建目录。
     fn write_file(&self, path: &Path, content: &str) -> io::Result<()>;
 
     /// 列目录条目（对应 `fs::read_dir` + `file_type`）。
@@ -86,6 +89,11 @@ impl Runtime for LocalRuntime {
     }
 
     fn write_file(&self, path: &Path, content: &str) -> io::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, content)
     }
 

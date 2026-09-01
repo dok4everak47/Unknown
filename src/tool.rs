@@ -37,7 +37,7 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write_file",
-            description: "Write a file to the current project. The path must be inside the project directory.",
+            description: "Write a file to the current project. Creates missing parent directories automatically (e.g. src/main.rs). The path must be inside the project directory.",
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -527,25 +527,35 @@ fn resolve_within(root: &Path, path: &str, allow_missing: bool) -> Result<PathBu
             Ok(resolved)
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound && allow_missing => {
-            // 目标文件尚不存在（write 场景）：校验父目录是否在 root 内
-            let parent = full
-                .parent()
-                .ok_or_else(|| ToolError::InvalidArguments(format!("invalid path: {path}")))?;
-            let parent = parent
-                .canonicalize()
-                .map_err(|err| match err.kind() {
-                    io::ErrorKind::NotFound => {
-                        ToolError::NotFound(format!("parent directory of {path}"))
+            // 目标路径尚不存在（write 场景），可能含多级尚未创建的目录
+            // （如 src/main.rs）：沿父级向上找到最近的已存在目录，
+            // canonicalize 后确认它仍在 root 内（已存在的祖先若为指向
+            // root 外的 symlink 会在此被拦截），再把不存在的尾部拼回。
+            let mut existing = full.clone();
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                match existing.canonicalize() {
+                    Ok(resolved) => {
+                        if !resolved.starts_with(&root) {
+                            return Err(ToolError::OutsideProject(path.to_string()));
+                        }
+                        let mut result = resolved;
+                        for component in tail.iter().rev() {
+                            result = result.join(component);
+                        }
+                        return Ok(result);
                     }
-                    _ => ToolError::Io(err),
-                })?;
-            if !parent.starts_with(&root) {
-                return Err(ToolError::OutsideProject(path.to_string()));
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent())
+                        else {
+                            return Err(ToolError::Io(err));
+                        };
+                        tail.push(name.to_os_string());
+                        existing = parent.to_path_buf();
+                    }
+                    Err(err) => return Err(ToolError::Io(err)),
+                }
             }
-            let file_name = full
-                .file_name()
-                .ok_or_else(|| ToolError::InvalidArguments(format!("invalid path: {path}")))?;
-            Ok(parent.join(file_name))
         }
         Err(err) => match err.kind() {
             io::ErrorKind::NotFound => Err(ToolError::NotFound(path.to_string())),
@@ -865,16 +875,19 @@ mod tests {
     }
 
     #[test]
-    fn write_missing_parent_directory_reports_error() {
+    fn write_creates_missing_parent_directories() {
         let root = temp_root();
         let tool = Tool::WriteFile(WriteFile {
             path: "no/such/dir/out.txt".to_string(),
             content: "x".to_string(),
         });
-        assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
-            Err(ToolError::NotFound(_))
-        ));
+        let result = tool.execute(&LocalRuntime, &root);
+        assert!(result.is_ok(), "{result:?}");
+        // 多级父目录被自动创建，内容落盘
+        assert_eq!(
+            fs::read_to_string(root.join("no/such/dir/out.txt")).unwrap(),
+            "x"
+        );
     }
 
     #[test]
