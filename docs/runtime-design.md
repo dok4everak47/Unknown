@@ -456,9 +456,16 @@ build.rs / proc-macro / 测试二进制）获得 OS 层真实隔离**，作为�
 - 构造安全：非 macOS 或 `/usr/bin/sandbox-exec` 不存在 →
   `io::Error`（`io::Error::other` / `ErrorKind::NotFound`，清晰报错、CLI 退出），
   **绝不静默降级为不隔离**。
-- CLI：`MYAGENT_SANDBOX=1/true` 启用（默认关）；与 `MYAGENT_RUNTIME`
-  （local/nix）、`MYAGENT_READ_ONLY` 三方正交可组合。启动时 stderr 打印
+- CLI：`MYAGENT_SANDBOX=1/true` 启用（默认关）；与 `MYAGENT_READ_ONLY`
+  正交可组合；与 `MYAGENT_RUNTIME=local` 正交可组合。启动时 stderr 打印
   `sandbox: on (network: off)` / `sandbox: on (network: ON)`。
+  **已验证局限**：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
+  `nix develop`）当前不可用：nix 评估 flake 需写 `$HOME/.cache/nix/
+  fetcher-locks/` 与 `$HOME/.local/state/nix/profiles/`，均在 ROOT/TMPDIR 之外
+  被拒；不为之放宽策略（profiles 是 GC roots / profile 符号链接）。等效且已
+  端到端验证的用法：在 `nix develop` shell 内（local runtime）启动 agent +
+  `MYAGENT_SANDBOX=1`。未来路径：`XDG_CACHE_HOME`/`XDG_STATE_HOME` 重定向进
+  ROOT/TMPDIR（已验证 nix 尊重），需 env 注入能力，另立任务。
 - 测试：9 个单测（任何平台）+ 3 个 gated 集成测试（攻击矩阵 /
   恶意 build.rs + 无害对照组 / 网络边界），gated 测试运行时自动探测
   sandbox-exec 真实可用才执行，嵌套沙箱环境自动跳过（对齐 nix 冒烟测试

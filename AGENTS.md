@@ -76,6 +76,11 @@ proc-macro / 测试二进制放进 macOS Seatbelt 沙箱；文件操作仍直接
 `MYAGENT_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec` 不存在
 → 构造失败、清晰报错并退出，**绝不静默降级为不隔离**。与 `MYAGENT_RUNTIME`（local /
 nix）、`MYAGENT_READ_ONLY` 三方正交可组合。
+**已验证局限**：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
+`nix develop`）当前不可用——nix 需在 `$HOME/.cache/nix` /
+`$HOME/.local/state/nix` 写锁文件，被策略拒绝；不为之放宽 $HOME 写权限。
+等效用法：在 `nix develop` shell 内启动 agent + `MYAGENT_SANDBOX=1`
+（工具链仍是 nix 的，隔离效果相同，已端到端验证）。
 
 权限分化由 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
 取值为 `1` / `true`（大小写不敏感）时启用只读模式——`write_file` / `edit_file`

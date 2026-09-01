@@ -151,9 +151,22 @@ exec argv 变换（纯函数，可单测）：
 组合示例：
 
 ```bash
-MYAGENT_RUNTIME=nix MYAGENT_SANDBOX=1 cargo run   # nix devShell + Seatbelt
+# 推荐（已端到端验证）：在 nix develop shell 内启动 agent + 沙箱——
+# 工具链是 nix 的，cargo / build.rs 同被 Seatbelt 禁锢
+nix develop
+MYAGENT_SANDBOX=1 cargo run
 MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉依赖
 ```
+
+> **已验证局限（2026-09-01）**：`MYAGENT_RUNTIME=nix` 与 `MYAGENT_SANDBOX=1`
+> 的组合（sandbox-exec 包 `nix develop`）当前**不可用**：nix 评估 flake 时需在
+> `$HOME/.cache/nix/fetcher-locks/` 建锁文件（随后建 profile 还需写
+> `$HOME/.local/state/nix/profiles/`），均在 ROOT/TMPDIR 之外被策略拒绝
+> （`Operation not permitted`）。**不为此放宽策略**：profiles 目录是 GC roots /
+> profile 符号链接，对 $HOME 放行写会破坏沙箱意义。上面"shell 内 + sandbox"的
+> 用法提供等效保证（工具链来自 nix、衍生进程被禁锢）。未来路径：把
+> `XDG_CACHE_HOME` / `XDG_STATE_HOME` 重定向进 ROOT/TMPDIR（已验证 nix 尊重
+> 这两个变量），需要 env 注入能力，另立任务。
 
 ## 6. 明确不做（第一版边界）
 

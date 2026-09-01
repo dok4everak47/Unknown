@@ -114,6 +114,12 @@ deny 全部写与网络，再仅放行工作目录与 `TMPDIR` 两个 subpath �
 不可用则构造失败、清晰报错并退出，绝不静默降级为不隔离。与 `MYAGENT_RUNTIME`（local /
 nix）、`MYAGENT_READ_ONLY` 三方正交可组合，默认行为零变化。
 
+> 已验证局限：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
+> `nix develop`）当前不可用——nix 需在 `$HOME/.cache/nix` 等目录写锁文件，
+> 被策略拒绝（不为之放宽 `$HOME` 写权限）。等效用法：在 `nix develop` shell
+> 内启动 agent 再加 `MYAGENT_SANDBOX=1`——工具链仍是 nix 的，cargo /
+> build.rs 同被 Seatbelt 禁锢（已端到端验证）。
+
 手动验证隔离效果（需在普通终端运行，嵌套沙箱环境会自动报错退出）：
 `./scripts/seatbelt-policy-test.sh`——直测 Seatbelt 策略（5 种写逃逸攻击
 均被拒、ROOT/TMPDIR 写入放行、网络默认关 / opt-in 放行）。
