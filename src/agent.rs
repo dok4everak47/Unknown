@@ -72,7 +72,7 @@ impl<M: Model> Agent<M> {
     /// 委托 [`Agent::new_with_runtime`] + [`LocalRuntime`]。
     #[allow(dead_code)]
     pub fn new(model: M) -> Result<Self, std::io::Error> {
-        Self::new_with_runtime(model, Box::new(LocalRuntime))
+        Self::new_with_runtime(model, Box::new(LocalRuntime::default()))
     }
 
     /// 以当前工作目录作为工具执行根目录、注入指定 Runtime 创建 Agent。
@@ -110,7 +110,7 @@ impl<M: Model> Agent<M> {
         Self {
             model,
             root,
-            runtime: Box::new(LocalRuntime),
+            runtime: Box::new(LocalRuntime::default()),
             capabilities: Capabilities::default(),
         }
     }
@@ -265,7 +265,7 @@ mod tests {
         Agent {
             model,
             root,
-            runtime: Box::new(LocalRuntime),
+            runtime: Box::new(LocalRuntime::default()),
             capabilities: Capabilities::default(),
         }
     }

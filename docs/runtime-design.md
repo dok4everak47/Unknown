@@ -2,7 +2,8 @@
 
 > 状态：**§5 条件 2 已触发；`Runtime` trait 与 `NixRuntime` 已落地（2026-08-31）；
 >       §5 条件 3 已触发；`Capabilities` 权限门已落地（2026-08-31，见 §9）；
->       Sandbox（Seatbelt 装饰器）已落地（2026-09-01，见 §10）**
+>       Sandbox（Seatbelt 装饰器）已落地（2026-09-01，见 §10）；
+>       §5 条件 1 已触发；`RuntimeConfig`（exec 超时可配置）已落地（2026-09-01，见 §11）**
 > 关联：AGENTS.md、README TODO、docs/sandbox-design.md
 > §6 方案 B / 方案 C 草案与实际实现的差异见文末 §8 / §9「已落地形态」
 
@@ -367,11 +368,9 @@ impl Default for Capabilities {
 ## 7. 当前明确不做
 
 已落地：`Runtime` trait（§5 条件 2，见 §8）、`NixRuntime`（§8）、`Capabilities`
-权限门（§5 条件 3，见 §9）、`Sandbox`（Seatbelt 装饰器，见 §10）。以下仍
-**未实现**，且当前**无需求**，不要提前引入：
+权限门（§5 条件 3，见 §9）、`Sandbox`（Seatbelt 装饰器，见 §10）、`RuntimeConfig`
+（§5 条件 1，见 §11）。以下仍**未实现**，且当前**无需求**，不要提前引入：
 
-- **RuntimeContext struct** —— 无可变超时/可控 env 需求（§5 条件 1 未触发；
-  当前实现硬编码 60s 超时、继承 env）
 - **Container / remote executor** —— 无远程/隔离执行需求
 - **exec 白名单扩展** —— 有明确需求再议，需与 nix develop / sandbox 语义配合
 
@@ -468,3 +467,46 @@ build.rs / proc-macro / 测试二进制）获得 OS 层真实隔离**，作为�
 **与 §6 草案的差异**：草案（方案 B/C）没有装饰器形态；实际落地保持 `Runtime`
 trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 `tool.rs`、`agent.rs`
 零改动，且天然可与 NixRuntime、Capabilities 组合。
+
+## 11. RuntimeContext（exec 超时可配置）已落地形态（2026-09-01）
+
+§5 条件 1 已触发：需要为 exec 设置不同于 60s 的超时（沙箱内冷构建 / LTO 较慢），
+且 `ExecError::TimedOut` 路径在默认 60s 超时下完全测不到——测试需要可注入的短超时。
+实际落地的是 §6 方案 A 的**最小子集**（只取 timeout，不取 env）：
+
+- `RuntimeConfig`（`src/runtime.rs`）——执行参数结构：
+  `pub struct RuntimeConfig { pub exec_timeout: Duration }`，`Default` =
+  60s（`EXEC_TIMEOUT` 常量保留为默认值来源）。config 挂在**实现结构体**上
+  （`LocalRuntime` / `NixRuntime` / `SandboxedRuntime` 各持一份），
+  **不改 `Runtime` trait 形状**——`Runtime::exec` 签名不变。
+- `run_command` 增加 `timeout: Duration` 参数（轮询逻辑不变，`EXEC_TIMEOUT`
+  换成传入的 `timeout`）；`LocalRuntime` / `NixRuntime` / `SandboxedRuntime`
+  各自把 `self.config.exec_timeout` 传给 `run_command`。
+- `LocalRuntime` 从单元结构体改为持有 `config: RuntimeConfig`：
+  `LocalRuntime::new(config)` 公开构造；`Default` 委托
+  `RuntimeConfig::default()`（行为零变化）；`#[cfg(test)] with_timeout(duration)`
+  测试构造器，用于覆盖 `TimedOut` 路径。
+- `NixRuntime::new(config)`：`nix --version` 可用性探测用**默认超时**（60s）；
+  exec 用 `config.exec_timeout`。
+- `SandboxedRuntime::new(root, network, config, inner)`：它不调 inner.exec
+  （自己 re-wrap 后调 `run_command`），故同样需要 config。
+- CLI：`MYAGENT_EXEC_TIMEOUT_SECS`（秒）——未设置 → 默认 60s；设置了但非法
+  （0 / 非数字 / 溢出）→ 清晰报错并 exit 1（与 nix 不可用的处理风格一致）。
+  解析为纯函数 `parse_exec_timeout`（`src/main.rs`，单测覆盖）。启动横幅**不**
+  打印超时（避免噪声）。
+- 测试：`LocalRuntime::with_timeout(200ms)` 覆盖——`sh -c "sleep 1"` →
+  `Err(TimedOut)`；`sh -c "echo before; sleep 1"` → `TimedOut(output)` 保留部分
+  输出；`sh -c "echo ok"` 在超时内正常完成 → `Ok` code=0；`RuntimeConfig::default()`
+  = 60s；`parse_exec_timeout` 的合法/非法输入单测。
+
+**env 覆盖仍不做**：§5 条件 1 的"可控环境变量"部分未触发——沙箱设计已把
+“继承完整环境”定为 v1 接受的局限（`docs/sandbox-design.md` §5.2），模型不应
+能改 PATH 等；`RuntimeConfig` 刻意只含 `exec_timeout`，env 覆盖/清洗/allowlist
+留作未来项。§6 方案 A 的 `RuntimeContext`（root+timeout+env 收拢）**未**整体落地
+——root 仍由 `Agent` 持有并注入，只落地了 timeout 一个字段。
+
+**与 §6 草案的差异**：草案的 `RuntimeContext` 是 `root + timeout + env` 三字段
+并整体替换 `Tool::execute_in(&root)`。实际落地**没有引入 context 结构，也没有改
+工具层签名**——config 直接挂在 runtime 实现上，改动面收敛在 `runtime.rs` 与其
+调用点，工具层与 Agent 零架构变化（仅测试里 `&LocalRuntime` 机械更新为
+`&LocalRuntime::default()`）。

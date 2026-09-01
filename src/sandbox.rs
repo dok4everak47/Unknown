@@ -27,7 +27,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::runtime::{ExecError, ExecOutput, Runtime, RuntimeEntry, run_command};
+use crate::runtime::{ExecError, ExecOutput, Runtime, RuntimeConfig, RuntimeEntry, run_command};
 
 /// Seatbelt 沙箱可执行文件路径（macOS 自带，随系统发布）。
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -46,6 +46,8 @@ pub struct SandboxedRuntime {
     tmpdir: PathBuf,
     /// 是否在沙箱内放开网络（`MYAGENT_SANDBOX_NETWORK=1/true`）。
     network: bool,
+    /// 执行参数（当前只有 exec 超时）。
+    config: RuntimeConfig,
 }
 
 impl SandboxedRuntime {
@@ -55,8 +57,14 @@ impl SandboxedRuntime {
     /// （构造失败、调用方清晰报错并退出，**绝不静默降级为不隔离**）。
     ///
     /// `root` 为 agent root（当前工作目录）；`network` 为网络开关；
-    /// `inner` 为被包装的 runtime（local / nix 选择之后）。
-    pub fn new(root: &Path, network: bool, inner: Box<dyn Runtime>) -> io::Result<Self> {
+    /// `config` 为执行参数（exec 超时）；`inner` 为被包装的 runtime
+    /// （local / nix 选择之后）。
+    pub fn new(
+        root: &Path,
+        network: bool,
+        config: RuntimeConfig,
+        inner: Box<dyn Runtime>,
+    ) -> io::Result<Self> {
         if !cfg!(target_os = "macos") {
             return Err(io::Error::other(
                 "Seatbelt sandbox requires macOS (sandbox-exec is not available on this platform)",
@@ -70,24 +78,43 @@ impl SandboxedRuntime {
                 ),
             ));
         }
-        Ok(Self::from_parts(root, resolve_tmpdir(), network, inner))
+        Ok(Self::from_parts(
+            root,
+            resolve_tmpdir(),
+            network,
+            config,
+            inner,
+        ))
     }
 
     /// 用显式 root / tmpdir 构造（探测与 env 解析由调用方决定；测试注入用）。
-    fn from_parts(root: &Path, tmpdir: PathBuf, network: bool, inner: Box<dyn Runtime>) -> Self {
+    fn from_parts(
+        root: &Path,
+        tmpdir: PathBuf,
+        network: bool,
+        config: RuntimeConfig,
+        inner: Box<dyn Runtime>,
+    ) -> Self {
         Self {
             inner,
             root: canonicalize_or(root),
             tmpdir: canonicalize_or(&tmpdir),
             network,
+            config,
         }
     }
 
     /// 测试构造器：跳过 `new` 的 macOS / sandbox-exec 探测与 env 解析，
     /// 直接指定 root / tmpdir / network（与 `NixRuntime` 测试直接构造一致）。
     #[cfg(test)]
-    fn for_test(root: &Path, tmpdir: &Path, network: bool, inner: Box<dyn Runtime>) -> Self {
-        Self::from_parts(root, tmpdir.to_path_buf(), network, inner)
+    fn for_test(
+        root: &Path,
+        tmpdir: &Path,
+        network: bool,
+        config: RuntimeConfig,
+        inner: Box<dyn Runtime>,
+    ) -> Self {
+        Self::from_parts(root, tmpdir.to_path_buf(), network, config, inner)
     }
 }
 
@@ -106,7 +133,7 @@ impl Runtime for SandboxedRuntime {
 
     fn exec(&self, program: &str, args: &[String], cwd: &Path) -> Result<ExecOutput, ExecError> {
         let argv = sandbox_argv(program, args, &self.root, &self.tmpdir, self.network);
-        run_command(&argv[0], &argv[1..], cwd)
+        run_command(&argv[0], &argv[1..], cwd, self.config.exec_timeout)
     }
 }
 
@@ -181,7 +208,7 @@ fn sbpl_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::LocalRuntime;
+    use crate::runtime::{LocalRuntime, RuntimeConfig};
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -353,7 +380,13 @@ mod tests {
         let s_tmp = c_tmp.display().to_string();
         let s_out = c_out.display().to_string();
 
-        let rt = SandboxedRuntime::for_test(&c_root, &c_tmp, false, Box::new(LocalRuntime));
+        let rt = SandboxedRuntime::for_test(
+            &c_root,
+            &c_tmp,
+            false,
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
+        );
 
         // 控制组：ROOT / TMPDIR 内写入必须放行（策略不误伤）
         run_sh(
@@ -458,7 +491,13 @@ mod tests {
         // 用 bash /dev/tcp（macOS 自带），避免依赖 nc；1.1.1.1:80 必然可达
         let probe = "bash -c 'echo > /dev/tcp/1.1.1.1/80'".to_string();
 
-        let rt_off = SandboxedRuntime::for_test(&root, &tmp, false, Box::new(LocalRuntime));
+        let rt_off = SandboxedRuntime::for_test(
+            &root,
+            &tmp,
+            false,
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
+        );
         let out = run_sh(&rt_off, &root, &probe);
         assert_ne!(
             out.code, 0,
@@ -466,7 +505,13 @@ mod tests {
             out.output
         );
 
-        let rt_on = SandboxedRuntime::for_test(&root, &tmp, true, Box::new(LocalRuntime));
+        let rt_on = SandboxedRuntime::for_test(
+            &root,
+            &tmp,
+            true,
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
+        );
         let out = run_sh(&rt_on, &root, &probe);
         assert_eq!(
             out.code, 0,
@@ -583,7 +628,13 @@ fn main() {
         // 注入的 TMPDIR = 项目内 tmp（允许写）；伪造 HOME 在 base 下，
         // 不落在 ROOT 或注入 TMPDIR 内 → 沙箱内写被拒。
         let tmp = project.join("tmp");
-        let rt_off = SandboxedRuntime::for_test(&project, &tmp, false, Box::new(LocalRuntime));
+        let rt_off = SandboxedRuntime::for_test(
+            &project,
+            &tmp,
+            false,
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
+        );
 
         let out = cargo_build(&rt_off, &project, &home);
         let out = out.expect("cargo build should run to completion");
@@ -624,7 +675,13 @@ fn main() {
 
         // ---- 网络 opt-in：重写 build.rs 强制重跑，外联必须成功 ----
         fs::write(project.join("build.rs"), MALICIOUS_BUILD_RS).unwrap();
-        let rt_on = SandboxedRuntime::for_test(&project, &tmp, true, Box::new(LocalRuntime));
+        let rt_on = SandboxedRuntime::for_test(
+            &project,
+            &tmp,
+            true,
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
+        );
         let out = cargo_build(&rt_on, &project, &home)
             .expect("cargo build (network on) should run to completion");
         let status = fs::read_to_string(project.join("net_status.txt")).unwrap_or_else(|_| {
@@ -653,7 +710,8 @@ fn main() {
             &control,
             &control.join("tmp"),
             false,
-            Box::new(LocalRuntime),
+            RuntimeConfig::default(),
+            Box::new(LocalRuntime::default()),
         );
         let out = cargo_build(&rt_ctrl, &control, &base.join("control-home"))
             .expect("harmless control build must run");

@@ -12,12 +12,13 @@ mod tool;
 use crate::agent::Agent;
 use crate::capabilities::Capabilities;
 use crate::model::{ModelEvent, OpenAICompatibleModel};
-use crate::runtime::{LocalRuntime, Runtime};
+use crate::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 use crate::session::Session;
 
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// 默认会话文件路径；可用 `MYAGENT_SESSION` 环境变量覆盖。
 fn session_path() -> PathBuf {
@@ -29,7 +30,8 @@ fn session_path() -> PathBuf {
 /// 工具执行 Runtime 的选择：`MYAGENT_RUNTIME=local`（默认）/ `nix`。
 ///
 /// 返回 `Err(String)` 表示配置无效或 nix 不可用，调用方据此清晰报错并 exit 1。
-fn build_runtime() -> Result<Box<dyn Runtime>, String> {
+/// `config` 携带执行参数（当前只有 exec 超时），传给选中的 Runtime。
+fn build_runtime(config: RuntimeConfig) -> Result<Box<dyn Runtime>, String> {
     let value = match env::var("MYAGENT_RUNTIME") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => "local".to_string(),
@@ -39,8 +41,8 @@ fn build_runtime() -> Result<Box<dyn Runtime>, String> {
     };
 
     match value.as_str() {
-        "local" => Ok(Box::new(LocalRuntime)),
-        "nix" => match crate::nix_runtime::NixRuntime::new() {
+        "local" => Ok(Box::new(LocalRuntime::new(config))),
+        "nix" => match crate::nix_runtime::NixRuntime::new(config) {
             Ok(runtime) => Ok(Box::new(runtime)),
             Err(err) => Err(format!(
                 "MYAGENT_RUNTIME=nix but nix is not available: {err}\n  install nix (https://nixos.org/download) or use MYAGENT_RUNTIME=local"
@@ -50,6 +52,23 @@ fn build_runtime() -> Result<Box<dyn Runtime>, String> {
             "unknown MYAGENT_RUNTIME value: {other:?} (expected \"local\" or \"nix\")"
         )),
     }
+}
+
+/// 解析 `MYAGENT_EXEC_TIMEOUT_SECS`：正整数秒 → `Ok`；0、非数字、溢出 → `Err`。
+///
+/// 纯函数（不读 env、无副作用），便于单元测试；调用方对 `Err` 打印清晰错误
+/// 并 exit 1（与 nix 不可用的处理风格一致）。
+fn parse_exec_timeout(value: &str) -> Result<Duration, String> {
+    let secs: u64 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{value:?} is not a positive integer number of seconds"))?;
+    if secs == 0 {
+        return Err(format!(
+            "{value:?} is 0; exec timeout must be a positive number of seconds"
+        ));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// 只读模式：`MYAGENT_READ_ONLY` 取值为 `1` / `true`（大小写不敏感）时启用。
@@ -96,8 +115,22 @@ fn main() {
 
     let model = OpenAICompatibleModel::new(api_key);
 
+    // exec 超时配置：MYAGENT_EXEC_TIMEOUT_SECS（秒）；未设置 → 默认 60s。
+    // 设置了但非法（0 / 非数字 / 溢出）→ 清晰报错并退出（与 nix 不可用一致）。
+    // 启动横幅不打印超时（避免噪声）。
+    let config = match env::var("MYAGENT_EXEC_TIMEOUT_SECS") {
+        Ok(value) => match parse_exec_timeout(&value) {
+            Ok(exec_timeout) => RuntimeConfig { exec_timeout },
+            Err(msg) => {
+                eprintln!("MYAGENT_EXEC_TIMEOUT_SECS is invalid: {msg}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => RuntimeConfig::default(),
+    };
+
     // Runtime 选择：MYAGENT_RUNTIME=local（默认）/ nix（exec 落在 devShell）
-    let runtime = match build_runtime() {
+    let runtime = match build_runtime(config.clone()) {
         Ok(runtime) => runtime,
         Err(msg) => {
             eprintln!("{msg}");
@@ -119,7 +152,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match crate::sandbox::SandboxedRuntime::new(&root, network, runtime) {
+        match crate::sandbox::SandboxedRuntime::new(&root, network, config.clone(), runtime) {
             Ok(runtime) => Box::new(runtime),
             Err(err) => {
                 eprintln!(
@@ -235,5 +268,31 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_exec_timeout;
+    use std::time::Duration;
+
+    /// 正整数秒 → `Ok`。
+    #[test]
+    fn parse_valid_positive_seconds() {
+        assert_eq!(parse_exec_timeout("30"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_exec_timeout("1"), Ok(Duration::from_secs(1)));
+        assert_eq!(parse_exec_timeout("3600"), Ok(Duration::from_secs(3600)));
+    }
+
+    /// 0、空串、非数字、溢出 → `Err`（清晰错误信息）。
+    #[test]
+    fn parse_invalid_values_are_rejected() {
+        assert!(parse_exec_timeout("0").is_err());
+        assert!(parse_exec_timeout("").is_err());
+        assert!(parse_exec_timeout("abc").is_err());
+        assert!(parse_exec_timeout("-5").is_err());
+        assert!(parse_exec_timeout("1.5").is_err());
+        // 溢出 u64 → 解析失败
+        assert!(parse_exec_timeout("99999999999999999999999999").is_err());
     }
 }

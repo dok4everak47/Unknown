@@ -48,7 +48,7 @@ src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider + SSE 流式（complete_streaming）
 src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
 src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
-src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command
+src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command（exec 超时可配置：RuntimeConfig，MYAGENT_EXEC_TIMEOUT_SECS，默认 60s）
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
 src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 macOS Seatbelt 沙箱（/usr/bin/sandbox-exec + SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 控制），文件操作委托内层 runtime
 src/session.rs   conversation 持久化（Session::load / Session::save）
@@ -474,6 +474,7 @@ Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
 Capability-based execution（Capabilities 权限门，MYAGENT_READ_ONLY=1/true 只读模式）
 Sandbox（SandboxedRuntime 装饰器：exec 经 sandbox-exec 放进 macOS Seatbelt 沙箱，MYAGENT_SANDBOX=1/true 启用，MYAGENT_SANDBOX_NETWORK=1/true 放行网络；文件操作委托内层 runtime）
+Runtime config（RuntimeConfig：exec 超时可配置，MYAGENT_EXEC_TIMEOUT_SECS 秒，默认 60）
 .env 配置文件（工作目录 .env 自动加载，环境变量优先；模板见 .env.example）
 ```
 

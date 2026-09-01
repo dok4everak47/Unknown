@@ -75,7 +75,7 @@ Final Response
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + SSE 流式（`complete_streaming`）+ API 层序列化 |
 | `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
 | `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
-| `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command` |
+| `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command`（exec 超时可配置，`MYAGENT_EXEC_TIMEOUT_SECS`） |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
 | `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`MYAGENT_SANDBOX` / `MYAGENT_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
@@ -95,6 +95,10 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 - `local`（默认）— `LocalRuntime`，std 直连文件系统与进程；
 - `nix` — `NixRuntime`，文件操作委托本地（nix 不虚拟化文件系统），exec 经
   `nix develop --command` 在 flake.nix 声明的可复现 devShell 中执行（构造时验证 nix 可用）。
+
+exec 单次超时默认 60 秒，可用 `MYAGENT_EXEC_TIMEOUT_SECS`（正整数秒）调整——
+沙箱内冷构建 / LTO 较慢时调大；未设置走默认，非法取值（0 / 非数字 / 溢出）会
+清晰报错并退出。
 
 工具执行前还有一道能力门（`Capabilities`，`src/capabilities.rs`），CLI 用
 `MYAGENT_READ_ONLY` 控制：`1` / `true` 时为只读模式（`write_file` / `edit_file` /
@@ -152,6 +156,7 @@ MYAGENT_RUNTIME=nix cargo run   # exec 经 `nix develop --command` 在 devShell 
 MYAGENT_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行命令（与 MYAGENT_RUNTIME 正交）
 MYAGENT_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认禁网
 MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
+MYAGENT_EXEC_TIMEOUT_SECS=300 cargo run   # exec 超时调到 300s（默认 60s；冷构建/LTO 较慢时用）
 ```
 
 启动时会在 stderr 打印当前能力模式（`capabilities: full` / `capabilities: read-only`）
@@ -200,13 +205,14 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 - 只允许白名单命令：`cargo check` / `cargo test` / `cargo build` / `cargo clippy` / `cargo fmt --check`
 - 不使用 shell（无 `sh -c` / `bash -c`），通过 `std::process::Command` 直接传可执行文件与参数
 - 命令在项目工作目录内执行，继承当前环境变量，模型无法修改环境
-- 单次执行 60 秒超时；stdout / stderr / 退出码全部返回给模型
+- 单次执行 60 秒超时（默认；可用 `MYAGENT_EXEC_TIMEOUT_SECS` 调整为其他秒数）；stdout / stderr / 退出码全部返回给模型
 
 当 `MYAGENT_RUNTIME=nix` 时，exec 会被包装为 `nix develop --command <cmd>`，在
 flake.nix 声明的可复现 devShell 中执行（文件操作仍走本地）。flake 的 `shellHook`
 横幅只在交互式 tty 下打印，不会污染 exec 工具的输出。
 
-exec 本身仍不是完整 command execution（无 shell、白名单、60 秒超时）。
+exec 本身仍不是完整 command execution（无 shell、白名单、60 秒默认超时，
+可用 `MYAGENT_EXEC_TIMEOUT_SECS` 调整）。
 当需要真实隔离时（`MYAGENT_SANDBOX=1`），exec 会被包装为
 `sandbox-exec -p <policy> <cmd>`：Seatbelt 在 OS 层约束 cargo 及其衍生的
 `build.rs` / proc-macro / 测试二进制的写入路径与网络（deny 全写/全网 → 仅放行工作目录

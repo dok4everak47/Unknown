@@ -1,7 +1,9 @@
 use std::io;
 use std::path::Path;
 
-use crate::runtime::{ExecError, ExecOutput, LocalRuntime, Runtime, RuntimeEntry, run_command};
+use crate::runtime::{
+    ExecError, ExecOutput, LocalRuntime, Runtime, RuntimeConfig, RuntimeEntry, run_command,
+};
 
 /// 基于 Nix devShell 的 [`Runtime`] 第二实现。
 ///
@@ -17,6 +19,8 @@ use crate::runtime::{ExecError, ExecOutput, LocalRuntime, Runtime, RuntimeEntry,
 pub struct NixRuntime {
     /// 文件操作委托本地实现。
     local: LocalRuntime,
+    /// 执行参数（当前只有 exec 超时；`nix --version` 探测用默认超时）。
+    config: RuntimeConfig,
 }
 
 impl NixRuntime {
@@ -24,11 +28,18 @@ impl NixRuntime {
     ///
     /// nix 不存在（PATH 中找不到）时返回 `io::Error`（`NotFound`），
     /// 让调用方能给出清晰错误，而不是等到第一次 exec 才失败。
-    pub fn new() -> io::Result<Self> {
+    /// 可用性探测用默认超时（60s）即可；exec 用 `config.exec_timeout`。
+    pub fn new(config: RuntimeConfig) -> io::Result<Self> {
         let cwd = std::env::current_dir()?;
-        match run_command("nix", &["--version".to_string()], &cwd) {
+        match run_command(
+            "nix",
+            &["--version".to_string()],
+            &cwd,
+            RuntimeConfig::default().exec_timeout,
+        ) {
             Ok(ExecOutput { code: 0, .. }) => Ok(Self {
-                local: LocalRuntime,
+                local: LocalRuntime::new(config.clone()),
+                config,
             }),
             Ok(ExecOutput { code, .. }) => Err(io::Error::other(format!(
                 "`nix --version` exited with code {code}"
@@ -57,7 +68,7 @@ impl Runtime for NixRuntime {
 
     fn exec(&self, program: &str, args: &[String], cwd: &Path) -> Result<ExecOutput, ExecError> {
         let argv = nix_develop_argv(program, args);
-        run_command(&argv[0], &argv[1..], cwd)
+        run_command(&argv[0], &argv[1..], cwd, self.config.exec_timeout)
     }
 }
 
@@ -111,9 +122,10 @@ mod tests {
     fn file_operations_match_local_semantics() {
         // 直接构造（绕过 nix 探测）：文件操作与 nix 无关，必须与 LocalRuntime 语义一致。
         let nix_rt = NixRuntime {
-            local: LocalRuntime,
+            local: LocalRuntime::default(),
+            config: RuntimeConfig::default(),
         };
-        let local_rt = LocalRuntime;
+        let local_rt = LocalRuntime::default();
         let root = temp_root();
 
         let path = root.join("note.txt");
@@ -142,7 +154,7 @@ mod tests {
     /// 且 shellHook 的 🦀 横幅不会泄漏进 exec 输出。
     #[test]
     fn exec_runs_inside_nix_dev_shell_without_banner() {
-        let Ok(nix_rt) = NixRuntime::new() else {
+        let Ok(nix_rt) = NixRuntime::new(RuntimeConfig::default()) else {
             eprintln!("skipping: nix not available");
             return;
         };

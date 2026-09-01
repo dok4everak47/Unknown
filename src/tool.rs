@@ -654,7 +654,11 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "main.rs".to_string(),
         });
-        assert_eq!(tool.execute(&LocalRuntime, &root).unwrap(), "fn main() {}");
+        assert_eq!(
+            tool.execute(&LocalRuntime::default(), &root)
+                .unwrap(),
+            "fn main() {}"
+        );
     }
 
     #[test]
@@ -667,7 +671,11 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "src/lib.rs".to_string(),
         });
-        assert_eq!(tool.execute(&LocalRuntime, &root).unwrap(), "pub fn f() {}");
+        assert_eq!(
+            tool.execute(&LocalRuntime::default(), &root)
+                .unwrap(),
+            "pub fn f() {}"
+        );
     }
 
     #[test]
@@ -677,7 +685,7 @@ mod tests {
             path: "../../etc/passwd".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -689,7 +697,7 @@ mod tests {
             path: "/etc/passwd".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -710,7 +718,7 @@ mod tests {
         let tool = Tool::ReadFile(ReadFile {
             path: "link.txt".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root);
+        let result = tool.execute(&LocalRuntime::default(), &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -723,7 +731,7 @@ mod tests {
             path: "missing.rs".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -788,7 +796,9 @@ mod tests {
             content: "hello world".to_string(),
         });
 
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("out.txt"));
 
         let written = fs::read_to_string(root.join("out.txt")).unwrap();
@@ -805,7 +815,8 @@ mod tests {
             path: "src/lib.rs".to_string(),
             content: "pub fn f() {}".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         let written = fs::read_to_string(root.join("src/lib.rs")).unwrap();
         assert_eq!(written, "pub fn f() {}");
@@ -820,7 +831,8 @@ mod tests {
             path: "out.txt".to_string(),
             content: "new".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         assert_eq!(fs::read_to_string(root.join("out.txt")).unwrap(), "new");
     }
@@ -833,7 +845,7 @@ mod tests {
             content: "evil".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -846,7 +858,7 @@ mod tests {
             content: "evil".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -868,7 +880,7 @@ mod tests {
             path: "link.txt".to_string(),
             content: "evil".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root);
+        let result = tool.execute(&LocalRuntime::default(), &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -881,7 +893,7 @@ mod tests {
             path: "no/such/dir/out.txt".to_string(),
             content: "x".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root);
+        let result = tool.execute(&LocalRuntime::default(), &root);
         assert!(result.is_ok(), "{result:?}");
         // 多级父目录被自动创建，内容落盘
         assert_eq!(
@@ -904,7 +916,9 @@ mod tests {
             query: "Model".to_string(),
             path: None,
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("src/model.rs:1:pub struct Model {}"));
         assert!(result.contains("src/model.rs:3:// Model again"));
     }
@@ -921,7 +935,9 @@ mod tests {
             query: "needle".to_string(),
             path: Some("src".to_string()),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("src/a.rs:1:needle here"));
         assert!(!result.contains("tests/b.rs"));
     }
@@ -937,7 +953,9 @@ mod tests {
             query: "needle".to_string(),
             path: Some("src/a.rs".to_string()),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("src/a.rs:1:needle"));
         assert!(!result.contains("src/b.rs"));
     }
@@ -951,7 +969,9 @@ mod tests {
             query: "zzz".to_string(),
             path: None,
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("no matches"));
     }
 
@@ -995,7 +1015,7 @@ mod tests {
             path: Some("../../etc".to_string()),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1008,7 +1028,7 @@ mod tests {
             path: Some("/etc".to_string()),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1021,7 +1041,7 @@ mod tests {
             path: Some("missing".to_string()),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -1044,7 +1064,7 @@ mod tests {
             query: "needle".to_string(),
             path: Some("link".to_string()),
         });
-        let result = tool.execute(&LocalRuntime, &root);
+        let result = tool.execute(&LocalRuntime::default(), &root);
 
         fs::remove_dir_all(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -1069,7 +1089,9 @@ mod tests {
             query: "needle".to_string(),
             path: None,
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         fs::remove_dir_all(&outside).ok();
         assert!(result.contains("no matches"), "unexpected: {result}");
@@ -1089,7 +1111,9 @@ mod tests {
             query: "needle".to_string(),
             path: None,
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("text.rs:1:needle"));
         assert!(!result.contains("blob.bin"));
     }
@@ -1147,7 +1171,9 @@ mod tests {
             old: "hello".to_string(),
             new: "goodbye".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("a.txt"));
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
@@ -1164,7 +1190,8 @@ mod tests {
             old: "line two".to_string(),
             new: "LINE TWO".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "line one\nLINE TWO\nline three\n");
@@ -1181,7 +1208,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OldTextNotFound(_))
         ));
     }
@@ -1197,7 +1224,7 @@ mod tests {
             new: "goodbye".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::MultipleMatches(_))
         ));
 
@@ -1218,7 +1245,7 @@ mod tests {
             new: "b".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::MultipleMatches(_))
         ));
     }
@@ -1233,7 +1260,8 @@ mod tests {
             old: "one\ntwo".to_string(),
             new: "ONE\nTWO".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "ONE\nTWO\nthree\n");
@@ -1250,7 +1278,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::InvalidArguments(_))
         ));
     }
@@ -1264,7 +1292,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -1278,7 +1306,7 @@ mod tests {
             new: "x".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1292,7 +1320,7 @@ mod tests {
             new: "x".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::OutsideProject(_))
         ));
     }
@@ -1315,7 +1343,7 @@ mod tests {
             old: "outside".to_string(),
             new: "inside".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root);
+        let result = tool.execute(&LocalRuntime::default(), &root);
 
         fs::remove_file(&outside).ok();
         assert!(matches!(result, Err(ToolError::OutsideProject(_))));
@@ -1332,7 +1360,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::InvalidArguments(_))
         ));
 
@@ -1352,7 +1380,7 @@ mod tests {
             new: "bar".to_string(),
         });
         assert!(matches!(
-            tool.execute(&LocalRuntime, &root),
+            tool.execute(&LocalRuntime::default(), &root),
             Err(ToolError::MultipleMatches(_))
         ));
     }
@@ -1367,7 +1395,8 @@ mod tests {
             old: "hello".to_string(),
             new: "hello".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "hello\n");
@@ -1383,7 +1412,8 @@ mod tests {
             old: "return foo".to_string(),
             new: "return bar".to_string(),
         });
-        tool.execute(&LocalRuntime, &root).unwrap();
+        tool.execute(&LocalRuntime::default(), &root)
+            .unwrap();
 
         let edited = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(edited, "function foo() { return bar; }");
@@ -1664,7 +1694,7 @@ mod exec_tests {
         let args = serde_json::json!({ "command": "echo hello" });
         let tool = Tool::from_call("exec", &args).unwrap();
         assert!(matches!(
-            tool.execute(&LocalRuntime, Path::new(".")),
+            tool.execute(&LocalRuntime::default(), Path::new(".")),
             Err(ToolError::CommandNotAllowed(_))
         ));
     }
@@ -1675,7 +1705,9 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo test --offline".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
         assert!(result.contains("test result: ok"), "unexpected: {result}");
     }
@@ -1686,7 +1718,9 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo build --offline".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
     }
 
@@ -1696,7 +1730,9 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo clippy --offline".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(result.contains("exit code: 0"), "unexpected: {result}");
     }
 
@@ -1708,7 +1744,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        match tool.execute(&LocalRuntime, &root) {
+        match tool.execute(&LocalRuntime::default(), &root) {
             Err(ToolError::NonZeroExit(code, output)) => {
                 assert_ne!(code, 0);
                 assert!(
@@ -1726,7 +1762,9 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        let result = tool.execute(&LocalRuntime, &root).unwrap();
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
         assert!(
             result.contains("myagent-exec-fixture"),
             "unexpected: {result}"
@@ -1741,7 +1779,7 @@ mod exec_tests {
         let tool = Tool::Exec(Exec {
             command: "cargo check --offline".to_string(),
         });
-        match tool.execute(&LocalRuntime, &root) {
+        match tool.execute(&LocalRuntime::default(), &root) {
             Err(ToolError::NonZeroExit(_, output)) => {
                 // cargo 将编译错误写到 stderr，应出现在结果里
                 assert!(

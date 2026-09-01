@@ -4,8 +4,27 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// `exec` 单次命令执行的最长时长。
+/// `exec` 单次命令执行的最长时长（默认值；可经 [`RuntimeConfig::exec_timeout`] 覆盖）。
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runtime 执行参数（当前只有 exec 超时；env 覆盖刻意不做，见
+/// `docs/runtime-design.md`）。
+///
+/// 挂在具体实现结构体上（`LocalRuntime` / `NixRuntime` / `SandboxedRuntime`），
+/// **不改变** [`Runtime`] trait 的形状——`Runtime::exec` 签名保持不变。
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// exec 单次命令最长时长；超时 kill 子进程并返回 [`ExecError::TimedOut`]。
+    pub exec_timeout: Duration,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            exec_timeout: EXEC_TIMEOUT,
+        }
+    }
+}
 /// `exec` 超时轮询间隔。
 const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -38,7 +57,8 @@ pub struct ExecOutput {
 pub enum ExecError {
     /// spawn / wait 失败。
     Io(io::Error),
-    /// 超过 [`EXEC_TIMEOUT`] 超时，携带已捕获的输出。
+    /// 超过 exec 超时（默认 [`EXEC_TIMEOUT`]，可经 [`RuntimeConfig::exec_timeout`]
+    /// 配置），携带已捕获的输出。
     TimedOut(String),
 }
 
@@ -76,12 +96,38 @@ pub trait Runtime {
 
     /// 执行命令（对应 `std::process::Command` 直调），返回退出码与合并输出。
     ///
-    /// `cwd` 固定为项目根目录，继承当前环境变量；60 秒超时。
+    /// `cwd` 固定为项目根目录，继承当前环境变量；超时由实现配置
+    /// （默认 60 秒，见 [`RuntimeConfig`]）。
     fn exec(&self, program: &str, args: &[String], cwd: &Path) -> Result<ExecOutput, ExecError>;
 }
 
 /// 本地 Runtime：直接操作真实文件系统与进程（std 实现，当前唯一默认实现）。
-pub struct LocalRuntime;
+pub struct LocalRuntime {
+    /// 执行参数（当前只有 exec 超时）。
+    config: RuntimeConfig,
+}
+
+impl LocalRuntime {
+    /// 用指定执行参数构造（当前只有 [`RuntimeConfig::exec_timeout`]）。
+    pub fn new(config: RuntimeConfig) -> Self {
+        Self { config }
+    }
+
+    /// 测试辅助：指定 exec 超时，用于在测试里覆盖 [`ExecError::TimedOut`] 路径
+    /// （默认 60s 太长，测试用短超时才能稳定触发超时）。
+    #[cfg(test)]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::new(RuntimeConfig {
+            exec_timeout: timeout,
+        })
+    }
+}
+
+impl Default for LocalRuntime {
+    fn default() -> Self {
+        Self::new(RuntimeConfig::default())
+    }
+}
 
 impl Runtime for LocalRuntime {
     fn read_file(&self, path: &Path) -> io::Result<String> {
@@ -117,18 +163,20 @@ impl Runtime for LocalRuntime {
     }
 
     fn exec(&self, program: &str, args: &[String], cwd: &Path) -> Result<ExecOutput, ExecError> {
-        run_command(program, args, cwd)
+        run_command(program, args, cwd, self.config.exec_timeout)
     }
 }
 
-/// 通用命令执行：spawn → 60s 超时轮询 → 合并 stdout/stderr → 退出码。
+/// 通用命令执行：spawn → 超时轮询（`timeout`）→ 合并 stdout/stderr → 退出码。
 ///
 /// 被 [`LocalRuntime`] 与 [`NixRuntime`]（`nix develop --command` 包装）
 /// 共用，保证两个实现的超时、输出合并、退出码语义完全一致。
+/// 超时由调用方传入（实现从各自 [`RuntimeConfig`] 取）。
 pub(crate) fn run_command(
     program: &str,
     args: &[String],
     cwd: &Path,
+    timeout: Duration,
 ) -> Result<ExecOutput, ExecError> {
     let mut child = Command::new(program)
         .args(args)
@@ -147,7 +195,7 @@ pub(crate) fn run_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if start.elapsed() > EXEC_TIMEOUT {
+                if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     let output = collect_output(stdout, stderr);
@@ -187,4 +235,85 @@ fn collect_output(mut stdout: ChildStdout, mut stderr: ChildStderr) -> String {
         output.push_str(&err);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// 每个测试一个独立的临时目录，避免并行测试互相干扰。
+    fn temp_root() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("myagent-runtime-test-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `RuntimeConfig::default()` 超时为 60s（默认值，行为零变化）。
+    #[test]
+    fn default_config_timeout_is_60s() {
+        assert_eq!(
+            RuntimeConfig::default().exec_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(EXEC_TIMEOUT, Duration::from_secs(60));
+        // `LocalRuntime::default()` 与显式 `new(RuntimeConfig::default())` 等价
+        assert_eq!(
+            LocalRuntime::default().config.exec_timeout,
+            LocalRuntime::new(RuntimeConfig::default())
+                .config
+                .exec_timeout
+        );
+    }
+
+    /// TimedOut 路径（核心）：短超时下 `sleep 1` 被 kill，返回
+    /// `Err(ExecError::TimedOut(_))`（macOS/Linux 均有 sleep/sh）。
+    #[test]
+    fn exec_times_out_with_short_timeout() {
+        let rt = LocalRuntime::with_timeout(Duration::from_millis(200));
+        let cwd = temp_root();
+        let result = rt.exec("sh", &["-c".to_string(), "sleep 1".to_string()], &cwd);
+        assert!(
+            matches!(result, Err(ExecError::TimedOut(_))),
+            "expected TimedOut, got: {result:?}"
+        );
+    }
+
+    /// 超时前已捕获的部分输出必须保留在 `TimedOut(output)` 里。
+    #[test]
+    fn timed_out_captures_partial_output() {
+        let rt = LocalRuntime::with_timeout(Duration::from_millis(200));
+        let cwd = temp_root();
+        let result = rt.exec(
+            "sh",
+            &["-c".to_string(), "echo before; sleep 1".to_string()],
+            &cwd,
+        );
+        match result {
+            Err(ExecError::TimedOut(output)) => {
+                assert!(
+                    output.contains("before"),
+                    "partial output must be captured, got: {output:?}"
+                );
+            }
+            other => panic!("expected TimedOut with partial output, got: {other:?}"),
+        }
+    }
+
+    /// 超时内正常完成：200ms 超时跑 `echo ok` → `Ok`，code=0。
+    #[test]
+    fn exec_completes_within_timeout() {
+        let rt = LocalRuntime::with_timeout(Duration::from_millis(200));
+        let cwd = temp_root();
+        let output = rt
+            .exec("sh", &["-c".to_string(), "echo ok".to_string()], &cwd)
+            .unwrap();
+        assert_eq!(output.code, 0);
+        assert!(output.output.contains("ok"), "got: {:?}", output.output);
+    }
 }
