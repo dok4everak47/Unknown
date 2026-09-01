@@ -741,3 +741,15 @@ next steps — NOT to be done in autoresearch (features, need approval):
 - Also re-probed -fno-unroll-loops on the C under Apple clang (changed since #98's nix clang):
   size-neutral (2,106,704 B identical, sha f163dec8edd0) — -Oz unroll decisions size-optimal under
   both compilers. C-unroll dimension re-verified closed in the new toolchain.
+
+## Finding (#114) — frame-pointer lever re-verified closed; #105 ambiguity RESOLVED
+
+- Re-probed -fomit-frame-pointer on the C side under the new toolchain (Apple clang + Apple libLTO).
+  Hypothesis: #67's +48 KB regression was the machine-outliner's uniform-prologue factoring loss;
+  since #105 showed the C-outliner is a no-op via every controllable flag channel, the penalty might
+  be gone. FALSIFIED: identical +48 KB regression (2,156,224 B = 2,108 KB vs baseline 2,106,704 B).
+- RESOLVES #105's "already outlines OR ignores" ambiguity: Apple libLTO DOES run its own machine
+  outliner that depends on the uniform stp x29,x30 prologue pattern (the 'already outlines' branch).
+  The C frame-pointer prologues are a FEATURE for Apple libLTO's outliner — removing them regresses
+  +48 KB because the outliner loss exceeds the prologue savings. That outliner is not controllable
+  via any flag channel (all probed #104/#105). Frame-pointer dimension closed under both toolchains.
