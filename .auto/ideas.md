@@ -729,3 +729,15 @@ next steps — NOT to be done in autoresearch (features, need approval):
   compact_unwind 22 KB) or out-of-scope (TLS 1.2 fork ~30-40 KB, platform-verifier ~5-11 KB).
 - Also closed: -enable-misched=false (byte-neutral, sha change only) + -enable-tail-dup=false
   (flag nonexistent in LLVM 22). Scheduler/tail-dup toggle dimension fully closed.
+
+## Finding (#113) — C-at-Oz verified in new toolchain; jitterentropy -O0 is security-required
+
+- VERIFIED the aws-lc C is genuinely at -Oz in the new toolchain: 762 real compile commands all
+  use -Oz (Apple clang via cc-wrap.sh forwards CFLAGS correctly). The 12 apparent '-O0' entries are
+  the jitterentropy-only override: aws-lc-sys's cc_builder.rs jitter_entropy_cflags_guards filters
+  all -O flags out of CFLAGS and forces -O0 -U_FORTIFY_SOURCE for jitterentropy.c (the CPU-jitter
+  entropy source for the DRBG). Security-REQUIRED — optimization would destroy the timing-noise
+  entropy. Intrinsic, NOT a recoverable inefficiency. Do not chase this as a lever.
+- Also re-probed -fno-unroll-loops on the C under Apple clang (changed since #98's nix clang):
+  size-neutral (2,106,704 B identical, sha f163dec8edd0) — -Oz unroll decisions size-optimal under
+  both compilers. C-unroll dimension re-verified closed in the new toolchain.
