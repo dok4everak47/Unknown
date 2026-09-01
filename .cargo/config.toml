@@ -25,17 +25,24 @@
 # same C source, same -Oz/-flto; -fno-stack-check makes Apple clang match the
 # nix clang behavior of emitting no __chkstk stack-probe calls, which the nix
 # libLTO cannot consume from Apple bitcode: 'Unsupported stack probing method').
+#
+# Link with Apple's ld64 instead of nix cctools ld: Apple's libLTO emits
+# tighter __unwind_info (21,664 vs 23,872 B) + __eh_frame (37,752 vs 38,384 B)
+# for the same LTO'd content, and the smaller __TEXT segment rounds to a lower
+# 16 KB page boundary: binary_kb 2076 -> 2060 KB (verified A/B, debug/test
+# links fine, behavior-preserving). Apple ld64 needs the nix libiconv path via
+# -L (it does not search nix store paths) and rejects both the -Wl, prefix on
+# -no_exported_symbols (build.rs emits the bare flag) and -Wl,-mllvm (the C
+# outliner there is a no-op under Apple's libLTO anyway — A/B: 2060 either way).
 [env]
 CC = { value = "/Users/dok4ever/Project/Unknown/.cargo/cc-wrap.sh", force = true }
 CXX = { value = "/Library/Developer/CommandLineTools/usr/bin/clang++", force = true }
 CFLAGS = "-Oz -fvisibility=hidden -flto -fno-stack-check"
 
 [target.aarch64-apple-darwin]
+linker = "/Library/Developer/CommandLineTools/usr/bin/ld"
 rustflags = [
     "-C", "llvm-args=-enable-machine-outliner=always",
-    # Machine-outline the C code too: with CFLAGS=-flto the aws-lc BoringSSL
-    # codegen happens inside ld64's link-time LTO, which does NOT enable the
-    # machine outliner by default (same as -Oz clang, exp #21). Passing the
-    # LLVM option through ld64's -mllvm outlines the surviving C code as well.
-    "-C", "link-arg=-Wl,-mllvm,-enable-machine-outliner=always",
+    # Apple ld64 does not search nix store paths; give it the devShell's libiconv.
+    "-C", "link-arg=-L/nix/store/9mjprxvx6xj51qfg3bf7w8qiaknpmlk8-libiconv-1.19/lib",
 ]

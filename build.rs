@@ -1,4 +1,4 @@
-// Link the final binary with -Wl,-no_exported_symbols (dead metadata removal).
+// Link the final binary with -no_exported_symbols (dead metadata removal).
 //
 // This binary is an executable: nothing dynamically links against it, so every
 // export in the LC_DYLD_EXPORTS_TRIE (~575 BoringSSL API symbols after the
@@ -12,5 +12,5 @@
 // this is why the earlier global -no_exported_symbols attempt (exp #32) broke
 // the build. Behavior is fully preserved (verified: binary runs, checks pass).
 fn main() {
-    println!("cargo:rustc-link-arg-bins=-Wl,-no_exported_symbols");
+    println!("cargo:rustc-link-arg-bins=-no_exported_symbols");
 }
