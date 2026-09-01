@@ -399,9 +399,10 @@ mod tests {
         let mut conversation = Vec::new();
         let mut deltas = Vec::new();
         agent
-            .run_turn_streaming(&mut conversation, "hi", &mut |event| {
-                let ModelEvent::TextDelta(text) = event;
-                deltas.push(text);
+            .run_turn_streaming(&mut conversation, "hi", &mut |event| match event {
+                ModelEvent::TextDelta(text) => deltas.push(text),
+                // 默认实现不产生推理事件；此处仅需穷尽枚举变体
+                ModelEvent::ReasoningDelta(_) => {}
             })
             .unwrap();
 

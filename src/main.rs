@@ -115,30 +115,80 @@ fn sandbox_network() -> bool {
     }
 }
 
+/// 推理过程显示开关：`MYAGENT_SHOW_REASONING` 取值为 `1` / `true`（大小写不敏感）
+/// 时启用，**默认关**。开启时流式响应中模型的 `reasoning_content` 以暗色 💭
+/// 前缀实时显示（仅"路过"展示，绝不进入对话历史 / conversation）。
+fn show_reasoning_mode() -> bool {
+    show_reasoning_from(env::var("MYAGENT_SHOW_REASONING").ok())
+}
+
+/// 解析 `MYAGENT_SHOW_REASONING`（纯函数，便于单测）：`1` / `true`（大小写
+/// 不敏感）→ `true`；其余取值 / 未设置 → `false`。风格对齐
+/// `read_only_mode` / `sandbox_mode`，默认关、行为零变化。
+fn show_reasoning_from(value: Option<String>) -> bool {
+    match value {
+        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        None => false,
+    }
+}
+
 /// 处理一轮用户输入（tty / 非 tty 两条输入路径共用）：流式输出、错误链打印、
 /// 成功后保存 session。逻辑与原 turn 处理实现逐字一致。
 fn run_turn<M: Model>(agent: &Agent<M>, conversation: &mut Vec<Message>, path: &Path, text: &str) {
+    // 推理过程显示开关：MYAGENT_SHOW_REASONING=1/true 时，模型 reasoning_content
+    // 以暗色 💭 前缀实时显示（仅"路过"展示，不进对话历史）；默认关，行为零变化。
+    let show_reasoning = show_reasoning_mode();
     // 流式：收到第一个 TextDelta 时惰性打印 "AI: " 前缀，随后逐段输出并 flush；
     // 工具轮次期间（模型只发工具调用、无文本）不打印任何内容。
     let mut prefix_printed = false;
+    // 是否正处于暗色推理段（`\x1b[2m` 已打印、尚未复位）。
+    let mut reasoning_active = false;
     let mut printed_any = false;
     let result = agent.run_turn_streaming(conversation, text, &mut |event| {
-        let ModelEvent::TextDelta(delta) = event;
-        if !prefix_printed {
-            print!("AI: ");
-            prefix_printed = true;
+        match event {
+            ModelEvent::TextDelta(delta) => {
+                // 首个正式文本到来：若仍在暗色推理段，先复位 ANSI 并换行，
+                // 再打印正式回答前缀（暗色只包裹推理段，回答恢复常规样式）。
+                if reasoning_active {
+                    println!("\x1b[0m");
+                    reasoning_active = false;
+                }
+                if !prefix_printed {
+                    print!("AI: ");
+                    prefix_printed = true;
+                }
+                print!("{delta}");
+                printed_any = true;
+                io::stdout()
+                    .flush()
+                    .expect("failed to flush stdout");
+            }
+            ModelEvent::ReasoningDelta(delta) => {
+                // 仅开关打开时显示；开关关闭时直接忽略（与现状一致）。
+                if !show_reasoning || delta.is_empty() {
+                    return;
+                }
+                // 首个推理 chunk 惰性打印暗色前缀 💭，随后逐段输出并 flush。
+                if !reasoning_active {
+                    print!("\x1b[2m💭 ");
+                    reasoning_active = true;
+                }
+                print!("{delta}");
+                printed_any = true;
+                io::stdout()
+                    .flush()
+                    .expect("failed to flush stdout");
+            }
         }
-        print!("{delta}");
-        printed_any = true;
-        io::stdout()
-            .flush()
-            .expect("failed to flush stdout");
     });
 
     match result {
         Ok(()) => {
-            // 有增量输出则补换行（避免覆盖行内打字效果）
-            if printed_any {
+            // 有增量输出则补换行（避免覆盖行内打字效果）；若本轮以推理段结束
+            // （未迎来正式文本），先复位 ANSI 再换行，避免残色 / 粘连。
+            if reasoning_active {
+                println!("\x1b[0m");
+            } else if printed_any {
                 println!();
             }
             // 每轮成功完成后保存；Model error 时 run_turn_streaming 已回滚，不保存半成品
@@ -147,8 +197,10 @@ fn run_turn<M: Model>(agent: &Agent<M>, conversation: &mut Vec<Message>, path: &
             }
         }
         Err(err) => {
-            // 已打印部分内容时先换行，避免错误信息粘在残句上
-            if printed_any {
+            // 已打印部分内容时先换行，避免错误信息粘在残句上；推理段同样先复位。
+            if reasoning_active {
+                println!("\x1b[0m");
+            } else if printed_any {
                 println!();
             }
             eprintln!("error: {err}");
@@ -371,7 +423,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_path_from, parse_exec_timeout};
+    use super::{history_path_from, parse_exec_timeout, show_reasoning_from};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -393,6 +445,26 @@ mod tests {
         assert!(parse_exec_timeout("1.5").is_err());
         // 溢出 u64 → 解析失败
         assert!(parse_exec_timeout("99999999999999999999999999").is_err());
+    }
+
+    /// MYAGENT_SHOW_REASONING 开关解析（纯函数）：`1` / `true`（大小写不敏感）→ true。
+    #[test]
+    fn show_reasoning_flag_parses_truthy_values() {
+        assert!(show_reasoning_from(Some("1".to_string())));
+        assert!(show_reasoning_from(Some("true".to_string())));
+        assert!(show_reasoning_from(Some("TRUE".to_string())));
+        assert!(show_reasoning_from(Some(" True ".to_string())));
+    }
+
+    /// MYAGENT_SHOW_REASONING 开关解析（纯函数）：其余取值 / 未设置 → false
+    /// （默认关，行为零变化）。
+    #[test]
+    fn show_reasoning_flag_defaults_to_off() {
+        assert!(!show_reasoning_from(None));
+        assert!(!show_reasoning_from(Some("0".to_string())));
+        assert!(!show_reasoning_from(Some("false".to_string())));
+        assert!(!show_reasoning_from(Some("yes".to_string())));
+        assert!(!show_reasoning_from(Some(String::new())));
     }
 
     /// MYAGENT_HISTORY 未设置 → 默认 `<cwd>/.myagent_history`（相对路径）。

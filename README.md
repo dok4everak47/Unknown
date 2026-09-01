@@ -27,7 +27,8 @@ Nix
 - [x] 多轮 conversation（保留完整历史）
 - [x] Agent Loop
 - [x] Tool Calling（模型可发起工具调用）
-- [x] Streaming（SSE 流式输出：逐字显示回复，根治长请求被代理空闲超时掐断）
+- [x] Streaming（SSE 流式输出：逐字显示回复，根治长请求被代理空闲超时掐断；读取空闲超时 120s 防静默挂起）
+- [x] 推理过程可选显示（`MYAGENT_SHOW_REASONING=1`：暗色 💭 前缀，仅展示、不进对话历史）
 - [x] `read_file` 工具
 - [x] `write_file` 工具
 - [x] `search` 工具
@@ -164,6 +165,7 @@ MYAGENT_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行�
 MYAGENT_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认禁网
 MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
 MYAGENT_EXEC_TIMEOUT_SECS=300 cargo run   # exec 超时调到 300s（默认 60s；冷构建/LTO 较慢时用）
+MYAGENT_SHOW_REASONING=1 cargo run   # 实时显示模型推理过程（暗色 💭，不进对话历史；默认关）
 ```
 
 启动时会在 stderr 打印当前能力模式（`capabilities: full` / `capabilities: read-only`）
@@ -184,8 +186,11 @@ You: /exit
 
 工具执行时 stderr 显示 🔧 进度行（如 `🔧 read_file {"path":"foo.nix"}`，参数压成
 单行并截断到约 80 字符；被能力门拒绝时显示 `🚫 <name> (permission denied)`），
-多轮工具调用不再静默。模型请求超时会明确报错：连接建立 10s / 非流式整体 120s
-（流式 SSE 长连接只设连接超时，不设整体 timeout），报错后可直接重试。
+多轮工具调用不再静默。`MYAGENT_SHOW_REASONING=1` 可实时显示模型推理过程
+（暗色 💭 前缀，仅展示、不进对话历史；默认关，行为零变化）。模型请求超时会
+明确报错：连接建立 10s / 非流式整体 120s；流式 SSE 长连接只设连接与读取空闲
+超时、不设整体 timeout（收到字节即重置，长推理不误杀），但流式读取 120s 无
+任何数据会超时报错（如代理静默持有连接不吐字节），报错后可直接重试。
 
 退出方式：输入 `/exit`，或按 `Ctrl-D`（EOF）。
 

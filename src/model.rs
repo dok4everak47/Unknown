@@ -14,10 +14,14 @@ pub enum Response {
 
 /// 流式模型事件：供 UI 增量显示。
 ///
-/// 本轮只有文本增量（`TextDelta`）；工具调用过程不打印内容，保持最小。
+/// - `TextDelta`：正式回答的文本增量（进入对话历史）。
+/// - `ReasoningDelta`：推理过程增量——**纯展示用，不落对话历史**。
+///   模型的 `reasoning_content` 只经事件流"路过"显示，由 UI 决定是否打印；
+///   累加器（content / tool_calls）绝不吸收它，历史行为零变化。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelEvent {
     TextDelta(String),
+    ReasoningDelta(String),
 }
 
 /// 模型抽象：任何可对话的模型都实现此 trait
@@ -213,8 +217,9 @@ pub struct StreamToolCall {
 
 /// 单个 SSE chunk 的 JSON：`choices[0]` 是 `delta` 的载体。
 ///
-/// `reasoning_content` 未在此结构声明：serde 默认忽略未知字段，
-/// 从源头保证推理过程不进入累加器。
+/// `reasoning_content` 在 [`StreamDelta`] 中显式声明（serde 解析），但只经
+/// [`ModelEvent::ReasoningDelta`] 事件"路过"显示——累加器（content /
+/// tool_calls）永不吸收它，从结构上保证推理过程不进入对话历史。
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     choices: Vec<StreamChoice>,
@@ -234,6 +239,9 @@ struct StreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<StreamDeltaToolCall>,
+    /// 模型可选的推理过程增量。**只经事件流出，不进入累加器**。
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,8 +266,10 @@ struct StreamDeltaFunction {
 ///
 /// - 空行 / 注释行（`:` 开头）/ 非 `data:` 行 → 忽略，继续。
 /// - `data: [DONE]` → 流结束。
-/// - `data: <json>` → 解析 chunk，累加文本 / 工具调用，文本增量经 `on_event` 发出。
-///   `finish_reason` 为 `"tool_calls"` 时流结束（结果将组装为 [`Response::ToolCall`]）。
+/// - `data: <json>` → 解析 chunk：文本增量经 `TextDelta` 发出并累加，
+///   推理增量经 `ReasoningDelta` 发出（**不落历史**），工具调用按 index
+///   累加。`finish_reason` 为 `"tool_calls"` 时流结束（结果将组装为
+///   [`Response::ToolCall`]）。
 ///
 /// 纯函数：不依赖 reqwest / 网络，可独立构造事件流测试。
 fn parse_sse_line(
@@ -303,6 +313,14 @@ fn accumulate_chunk(
     {
         acc.content.push_str(text);
         on_event(ModelEvent::TextDelta(text.clone()));
+    }
+
+    // 推理过程增量：经 on_event 发出（供 UI 展示），**绝不追加到 content、
+    // 不进任何累加器**——只是"路过"显示，对话历史不含推理（历史行为零变化）。
+    if let Some(reasoning) = &choice.delta.reasoning_content
+        && !reasoning.is_empty()
+    {
+        on_event(ModelEvent::ReasoningDelta(reasoning.clone()));
     }
 
     // 工具调用分片：按 index 找到已有分片，id/name 取首个非空，arguments 拼接。
@@ -409,6 +427,12 @@ impl OpenAICompatibleModel {
 
 /// 连接阶段超时（共用）：连接建立挂死 10s 即报错，不无限等待。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 每次读取的空闲超时（共用语义）：连接活着但 120s 内没有任何数据字节即报错。
+/// 收到任意字节就重置计时——SSE 持续输出时永远不会触发，只拦截"静默挂起"。
+/// 注：reqwest 0.13.4 的 **blocking** `ClientBuilder` 未暴露 `read_timeout`
+/// （async 版本才有）；流式读取在 `complete_streaming` 里用
+/// 「读取线程 + `recv_timeout`」实现完全相同的语义，见下。
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// 非流式请求整体超时：一次性请求-响应，120s 覆盖慢推理，挂死则失败。
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -416,10 +440,11 @@ const COMPLETE_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// 超时策略：
 /// - 共用 `connect_timeout(10s)`——连接建立阶段挂死不无限等；
-/// - 非流式 `complete` 额外传入 `overall_timeout`（整体请求上限 120s）；
+/// - 非流式 `complete` 传入 `overall_timeout`（整体请求上限 120s，
+///   对"连接活着但无数据"的场景已构成兜底，不会无限等待）；
 /// - 流式 `complete_streaming` 传 `None`——SSE 是长连接，**绝不设整体
 ///   timeout**，整体 timeout 会按总时长误杀长推理（streaming 的设计就是
-///   靠持续字节保活）。
+///   靠持续字节保活）；每次读取的空闲超时（`READ_TIMEOUT`）在读取线程侧实现。
 ///
 /// `build()` 失败（如 rustls 初始化）经 `?` 传播，不吞错。
 fn blocking_client(
@@ -433,10 +458,22 @@ fn blocking_client(
     Ok(builder.build()?)
 }
 
+/// 有界回收流式读取线程：正常路径下服务端通常随 `[DONE]` 终止 body，线程在
+/// body EOF 后立即退出，这里短等回收；若线程仍阻塞在读取上（服务端挂住 body /
+/// 静默代理），超时后直接 drop `JoinHandle`（detach），不阻塞主线程——连接关闭
+/// 后该线程会自行退出。
+fn reap_reader(reader: std::thread::JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while !reader.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // 未在期限内退出 → drop JoinHandle，线程 detach
+}
+
 impl Model for OpenAICompatibleModel {
     fn complete(&self, messages: &[Message]) -> Result<Response, Box<dyn std::error::Error>> {
         // 非流式：一次性请求-响应。共用连接超时 10s，外加整体超时 120s
-        // （覆盖慢推理；挂死则失败）。build() 失败经 `?` 传播。
+        // （覆盖慢推理与"连接活着但无数据"，不会无限等待）。build() 失败经 `?` 传播。
         let client = blocking_client(Some(COMPLETE_TIMEOUT))?;
 
         let request = ChatRequest {
@@ -506,8 +543,14 @@ impl Model for OpenAICompatibleModel {
     /// 文本增量实时经 `on_event` 发出（根治长请求被代理空闲超时掐断）。
     ///
     /// 只处理 `data: ` 前缀的行；`data: [DONE]` 结束流。`reasoning_content`
-    /// 在解析层即被忽略（不追加、不显示、不进对话历史）。工具调用按 index
-    /// 跨分片累加，流结束后组装为 [`Response`]。
+    /// 不进入累加器（不追加 content、不进对话历史），只经 `ReasoningDelta`
+    /// 事件"路过"显示，由 UI 决定是否打印。工具调用按 index 跨分片累加，
+    /// 流结束后组装为 [`Response`]。
+    ///
+    /// 读取空闲超时（`READ_TIMEOUT`，120s）：reqwest blocking 0.13.4 未暴露
+    /// `read_timeout`，因此把阻塞读放到独立线程、行经通道送回主线程，主线程
+    /// `recv_timeout` 每次收一行即重置——语义与 `read_timeout` 一致：持续输出
+    /// 永不触发，只有"连接活着但 120s 无任何数据"才报错（不会误杀长推理）。
     fn complete_streaming(
         &self,
         messages: &[Message],
@@ -515,7 +558,7 @@ impl Model for OpenAICompatibleModel {
     ) -> Result<Response, Box<dyn std::error::Error>> {
         // 流式（SSE 长连接）：**只设连接超时 10s，绝不设整体 timeout**——
         // 整体 timeout 会按总时长误杀长推理；streaming 的设计就是靠持续
-        // 字节保活。build() 失败经 `?` 传播。
+        // 字节保活。空闲超时由下方读取线程 + recv_timeout 兜底。
         let client = blocking_client(None)?;
 
         let request = ChatRequest {
@@ -553,15 +596,64 @@ impl Model for OpenAICompatibleModel {
             return Err(format!("API error: {status} body={body}").into());
         }
 
-        // SSE 流：reqwest blocking 响应实现了 std::io::Read，用 BufRead 逐行读取。
+        // 读取线程：把 blocking 的逐行读放到独立线程（response 为 Send），行经
+        // 通道送回主线程。主线程 `recv_timeout(READ_TIMEOUT)` 实现每次读取的
+        // 空闲超时——收到任意一行就重置，只有"连接活着但 120s 无任何数据"才报错。
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, std::io::Error>>();
+        let reader = std::thread::spawn(move || {
+            let mut lines = std::io::BufReader::new(response).lines();
+            loop {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break; // 主线程已结束读取（[DONE] / 超时），停止发送
+                        }
+                    }
+                    Some(Err(err)) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
+                    None => break, // body EOF：正常流结束
+                }
+            }
+        });
+
         let mut acc = StreamAccumulator::default();
-        for line in std::io::BufReader::new(response).lines() {
-            let line = line?;
-            if parse_sse_line(&line, &mut acc, on_event) {
-                break;
+        let mut idle_timeout = false;
+        loop {
+            match rx.recv_timeout(READ_TIMEOUT) {
+                // 收到一行：解析 / 累加 / 发事件；同时重置空闲计时。
+                Ok(Ok(line)) => {
+                    if parse_sse_line(&line, &mut acc, on_event) {
+                        break; // [DONE] 或 finish_reason=tool_calls
+                    }
+                }
+                // 底层读取错误（连接中断等）：原样传播，不特殊包装。
+                Ok(Err(err)) => {
+                    drop(rx);
+                    reap_reader(reader);
+                    return Err(err.into());
+                }
+                // 连接活着但 120s 无数据：空闲超时（持续输出时每行都重置，不会误杀）。
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    idle_timeout = true;
+                    break;
+                }
+                // 读取线程已退出（body EOF）且行已消费完：流正常结束。
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-
+        drop(rx);
+        // 有界回收读取线程（正常路径 body EOF 后线程立即退出）；若仍阻塞在读取上
+        // （服务端挂住 body / 静默代理）则 detach，不阻塞主线程。
+        reap_reader(reader);
+        if idle_timeout {
+            return Err(format!(
+                "streaming response idle: no data for {}s (read timeout)",
+                READ_TIMEOUT.as_secs()
+            )
+            .into());
+        }
         Ok(stream_to_response(&acc))
     }
 }
@@ -698,27 +790,30 @@ mod tests {
         format!("data: {json}")
     }
 
-    /// 把一段 SSE 事件流逐行喂给解析器，收集结束标记与文本增量。
-    fn run_sse(stream: &str) -> (StreamAccumulator, Vec<String>, bool) {
+    /// 把一段 SSE 事件流逐行喂给解析器，收集结束标记、文本增量与推理增量。
+    fn run_sse(stream: &str) -> (StreamAccumulator, Vec<String>, Vec<String>, bool) {
         let mut acc = StreamAccumulator::default();
         let mut deltas = Vec::new();
+        let mut reasoning = Vec::new();
         let mut ended = false;
         for line in stream.lines() {
-            if parse_sse_line(line, &mut acc, &mut |event| {
-                let ModelEvent::TextDelta(text) = event;
-                deltas.push(text);
+            if parse_sse_line(line, &mut acc, &mut |event| match event {
+                ModelEvent::TextDelta(text) => deltas.push(text),
+                ModelEvent::ReasoningDelta(text) => reasoning.push(text),
             }) {
                 ended = true;
                 break;
             }
         }
-        (acc, deltas, ended)
+        (acc, deltas, reasoning, ended)
     }
 
     /// 真实形态的文本事件流：多段 delta + 空行 + 注释行 + 夹杂 reasoning_content + [DONE]。
     ///
     /// 断言：
-    /// (a) 文本跨 delta 正确累加，reasoning_content 被丢弃；
+    /// (a) 文本跨 delta 正确累加，reasoning_content 不进入 content；
+    /// (b) reasoning 经 `ReasoningDelta` 事件"路过"显示（内容正确），
+    ///     最终 [`Response`] 是纯文本，不含任何推理；
     /// 空行 / 注释行被忽略，[DONE] 结束流。
     #[test]
     fn sse_text_stream_accumulates_and_drops_reasoning() {
@@ -730,15 +825,22 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}
 \ndata: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}
 \ndata: [DONE]\n";
 
-        let (acc, deltas, ended) = run_sse(stream);
+        let (acc, deltas, reasoning, ended) = run_sse(stream);
 
         assert!(ended, "[DONE] should end the stream");
-        // (a) 文本正确累加，reasoning 被丢弃（不进入 content）
+        // (a) 文本正确累加，reasoning 不进入 content
         assert_eq!(acc.content, "Hello world!");
         // 每个文本 delta 都经 on_event 发出，供 UI 增量显示
         assert_eq!(deltas, vec!["Hello", " world", "!"]);
-        // reasoning_content 绝不进入工具调用累加器
+        // (b) reasoning 经 ReasoningDelta 事件"路过"，内容正确
+        assert_eq!(reasoning, vec!["thinking hard...", "more reasoning"]);
+        // reasoning 绝不进入工具调用累加器
         assert!(acc.tool_calls.is_empty());
+        // 最终 Response 是纯文本，不含任何推理
+        match stream_to_response(&acc) {
+            Response::Text(text) => assert_eq!(text, "Hello world!"),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     /// 两个工具调用的 arguments 跨多个分片，夹杂 reasoning_content，
@@ -792,11 +894,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}
 
         let mut acc = StreamAccumulator::default();
         let mut deltas = Vec::new();
+        let mut reasoning = Vec::new();
         let mut ended = false;
         for line in &lines {
-            if parse_sse_line(line, &mut acc, &mut |event| {
-                let ModelEvent::TextDelta(text) = event;
-                deltas.push(text);
+            if parse_sse_line(line, &mut acc, &mut |event| match event {
+                ModelEvent::TextDelta(text) => deltas.push(text),
+                ModelEvent::ReasoningDelta(text) => reasoning.push(text),
             }) {
                 ended = true;
                 break;
@@ -806,6 +909,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}
         assert!(ended, "finish_reason=tool_calls should end the stream");
         // 工具调用过程不产生任何文本增量
         assert!(deltas.is_empty());
+        // 夹杂的 reasoning 经事件"路过"（内容正确，不落历史）
+        assert_eq!(reasoning, vec!["deciding which tool..."]);
 
         // (b) 两个工具调用按 index 累加，id/name 取首个非空分片
         assert_eq!(acc.tool_calls.len(), 2);
