@@ -38,6 +38,7 @@ Nix
 - [x] Sandbox（`SandboxedRuntime` 装饰器：exec 经 `/usr/bin/sandbox-exec` 放进 macOS Seatbelt 沙箱，`MYAGENT_SANDBOX=1/true` 启用，`MYAGENT_SANDBOX_NETWORK=1/true` 放行网络；文件操作仍委托内层 runtime）
 - [x] Capability-based execution（`Capabilities` 权限门；`MYAGENT_READ_ONLY=1/true` 只读模式）
 - [x] Session persistence（conversation 保存/恢复，单 session）
+- [x] REPL 行编辑（rustyline：Ctrl+L 清屏、↑↓ 历史、行内编辑；历史持久化到 `.myagent_history`，`MYAGENT_HISTORY` 可覆盖）
 - [x] 基础路径边界校验（限制在工作目录内）
 - [x] Tool Result 回传 Model 后生成最终回答
 - [x] Nix Flake 开发环境
@@ -80,7 +81,7 @@ Final Response
 | `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`MYAGENT_SANDBOX` / `MYAGENT_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
-| `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入，创建 Model / Agent，显示结果 |
+| `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入（tty 下 rustyline 行编辑，非 tty 走 `BufRead::lines()`），创建 Model / Agent，显示结果 |
 
 ### 依赖方向
 
@@ -182,6 +183,18 @@ You: /exit
 ```
 
 退出方式：输入 `/exit`，或按 `Ctrl-D`（EOF）。
+
+交互模式（stdin 是终端时）使用 rustyline 行编辑：
+
+- `Ctrl-L` 立即清屏（提示符回到顶部，不需要回车）
+- `↑` / `↓` 浏览输入历史，`←` / `→` 移动光标修改当前行
+- `Ctrl-C` 放弃当前行、回到新提示符（bash 语义，不退出进程）
+- `Ctrl-D` 退出；`/exit` 退出；空行跳过
+
+历史记录只存用户输入文本（不存 AI 输出），每次退出时保存到 `.myagent_history`
+（默认在工作目录，可用 `MYAGENT_HISTORY` 环境变量覆盖），下次启动自动加载。
+该文件与 `session.json`（对话持久化）互不干扰，已加入 `.gitignore`。
+非 tty（管道输入 / `</dev/null` / 脚本）不使用 rustyline，行为与以前一致。
 
 对话会自动保存到 `session.json`（可用 `MYAGENT_SESSION` 环境变量指定路径）：
 

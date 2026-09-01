@@ -41,7 +41,7 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session）
+src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session、REPL 行编辑：tty 下 rustyline——Ctrl+L 清屏 / ↑↓ 历史 / 行内编辑、`.myagent_history` 持久化，非 tty 走 BufRead::lines()）
 src/config.rs    .env 配置加载（KEY=VALUE；环境变量优先于 .env；纯 std 解析）
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）

@@ -7,6 +7,10 @@ edition = "2024"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "blocking", "rustls", "system-proxy"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# REPL 行编辑（Ctrl+L 清屏、↑↓ 历史、行内编辑）。default-features = false 下
+# 仅需 with-file-history（load_history / save_history 的文件持久化）；
+# 默认 Ctrl+L / 方向键绑定无需 custom-bindings / with-dirs，故不开。
+rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
 
 [profile.release]
 strip = "symbols"
