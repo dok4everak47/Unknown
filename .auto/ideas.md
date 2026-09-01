@@ -753,3 +753,19 @@ next steps — NOT to be done in autoresearch (features, need approval):
   The C frame-pointer prologues are a FEATURE for Apple libLTO's outliner — removing them regresses
   +48 KB because the outliner loss exceeds the prologue savings. That outliner is not controllable
   via any flag channel (all probed #104/#105). Frame-pointer dimension closed under both toolchains.
+
+## FINAL CLOSURE (continuation session, exp #115) — the last two open dimensions closed
+
+**1. jitterentropy lever QUANTIFIED and FALSIFIED (-320 B, old attribution corrected):**
+- aws-lc-sys supports `AWS_LC_SYS_NO_JITTER_ENTROPY=1` (env_crate_var_to_bool("NO_JITTER_ENTROPY"), builder/main.rs) — skips compiling the entire jitterentropy.c CPU-jitter entropy collector.
+- Clean A/B: with-jitter = 2,106,704 B (sha 95376b54, the documented floor); without-jitter = 2,106,384 B (map confirms 0 jent_*/tree_jitter_* symbols) → **NET -320 B, binary_kb unchanged at 2060**.
+- ROOT CAUSE: the old "jitterentropy 13.9 KB" attribution (pre-toolchain-shift, nix-ld map) is WRONG for the current toolchain — Apple libLTO's function-granularity dead-strip already removes ~97% of jitterentropy (the RNG seeds from OS getentropy/CCRandomGenerateBytes; the CPU-jitter supplement's code is almost entirely unreachable at runtime). Only 320 B survives.
+- Even if it were 13.9 KB, it's an entropy-source (security) change — user-decision category. At 320 B it's categorically dead. CLOSED.
+- METHOD LESSON: command-line env vars do NOT reliably reach cargo build scripts here — must use .cargo/config.toml [env] + force a dep rebuild (touch build.rs or cargo clean -p); aws-lc-sys declares no rerun-if-env-changed for this var. Also: stale multi-config aws-lc-sys build dirs pollute cargo state — always `cargo clean` before a dep-level A/B.
+
+**2. Our own crate's code is LTO-inlined — no reduction headroom (read-only, linker-map):**
+- The #95 "myagent 62,616 B / 188 syms = 4.7%" attribution was an ARTIFACT of mangled-name prefix matching: 'myagent' appears in symbols of OTHER crates that reference our types via generic instantiation (reqwest::…::<myagent::model::…>, etc.).
+- Direct map extraction by the crate disambiguator `CswJSs7pirBJ_7myagent`: only **45 symbols / 3,740 B** remain identifiable, and the largest is a 1,064 B std-backtrace wrapper. The rest is < 400 B glue (drop_glue, serde wrappers, tiny helpers).
+- CONCLUSION: fat LTO (cgu=1, cross-crate) has inlined ~95% of our real code into callers (the TLS/HTTP monoliths). Our true unique footprint is a few KB of dense -Oz code with ZERO reducible bloat. src/** has no meaningful in-scope lever.
+
+**TERMINAL STATE (certified): binary_kb = 2060 KB (2,106,704 B, sha 95376b54, 515 x 4KB blocks).** Every dimension closed: profile, Rust+C-LTO passes, CFLAGS, linker/compiler (Apple clang+ld64), features, deps (incl. jitterentropy this session), our code (LTO-inlined), segments/padding/quantization. Zero in-scope non-behavior-changing hypotheses remain. Only user-decision paths: crash-diagnostics flags → 2032 KB; reqwest fork TLS 1.2 → ~2030 KB; platform-verifier → ~2056 KB; build-std (network-blocked); unicode-width (REPL wide-char, ~25 KB, behavior).
