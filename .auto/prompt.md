@@ -1,6 +1,6 @@
 # Autoresearch Prompt: reduce release binary size
 
-- Status: **ended (final) — binary_kb 5852 → 1928 KB (-67.1%) across 75 experiments; floor 1928 KB is deterministic (sha256-identical rebuilds), cold-reproducible, byte-accounted, and metric-quantized at 4 KB (needs ≥ 3,152 B to move, unreachable in-scope). Every dimension and config corner closed with evidence; zero in-scope hypotheses remain.**
+- Status: **ended (final) — binary_kb 5852 → 2060 KB (-64.8%) across 107 experiments in the CURRENT toolchain (rustc LLVM 22.1.8 + Apple CommandLineTools clang + Apple ld64). NOTE: the old-toolchain floor was 1928 KB (-67.1%); a toolchain shift (LLVM 22 codegen + Apple libLTO) added an inherent +148 KB regression (__text +82,932 + __const +56,593 B) that #102-#107 proved unrecoverable in-scope (every codegen dimension re-verified: -Oz, Rust outliner -32 KB full value, C-outliner no-op via all channels, threshold absent, scheduler closed, merge/global-merge/tail-merge no-ops). Apple clang (-16 KB) + Apple ld64 (-16 KB) recovered 32 KB of the shift. Floor 2060 KB is certified terminal: deterministic, byte-accounted, metric-quantized at 4 KB (515 blocks). Zero in-scope behavior-preserving hypotheses remain.**
 - Created: 2026-08-31
 - Owner: Pi autoresearch
 - Reviewer: Codex
@@ -295,7 +295,7 @@ Hypothesis → change one thing → measure → checks → keep/discard → log
 
 | ID | Hypothesis | Files changed | Before | After | Result | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| — | 尚未开始 | — | — | — | — | baseline 待测量 |
+| #102-#107 | New-toolchain re-optimization (see .auto/log.jsonl and ideas.md) | .cargo/config.toml + .cargo/cc-wrap.sh + build.rs | 2092 | 2060 KB | keep/discard mix | Apple clang + Apple ld64 recovered 32 KB of the +148 KB LLVM-22 toolchain shift; all codegen dimensions re-verified; 2060 KB certified terminal floor |
 
 ---
 
