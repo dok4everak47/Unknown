@@ -19,8 +19,16 @@
 # within the same image) while removing them from the export trie. Unlike
 # -no_exported_symbols (which broke proc-macro builds), this only touches the
 # aws-lc C compile. -Oz pinned so the C code stays size-optimized.
+# Compile the aws-lc (BoringSSL) C with Apple's CommandLineTools clang + -flto.
+# Apple clang's -flto IR LTOs ~16 KB smaller through ld64's libLTO than the
+# nix clang 21.1.8 IR (verified A/B: 2076 -> 2060 KB, behavior-preserving -
+# same C source, same -Oz/-flto; -fno-stack-check makes Apple clang match the
+# nix clang behavior of emitting no __chkstk stack-probe calls, which the nix
+# libLTO cannot consume from Apple bitcode: 'Unsupported stack probing method').
 [env]
-CFLAGS = "-Oz -fvisibility=hidden -flto"
+CC = { value = "/Users/dok4ever/Project/Unknown/.cargo/cc-wrap.sh", force = true }
+CXX = { value = "/Library/Developer/CommandLineTools/usr/bin/clang++", force = true }
+CFLAGS = "-Oz -fvisibility=hidden -flto -fno-stack-check"
 
 [target.aarch64-apple-darwin]
 rustflags = [
