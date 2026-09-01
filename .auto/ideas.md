@@ -719,3 +719,13 @@ next steps — NOT to be done in autoresearch (features, need approval):
 - **#104 Apple ld64 (-16 KB, 2076 -> 2060)**: Apple libLTO emits tighter __unwind_info (21,664 vs 23,872) + __eh_frame (37,752 vs 38,384), rounding __TEXT to a lower 16 KB page. Config: linker = Apple ld, bare -no_exported_symbols via build.rs (Apple ld rejects -Wl, prefix), -L nix libiconv, C-outliner link-arg removed (no-op under Apple libLTO).
 - **Re-verified under LLVM 22 (all closed)**: -Oz > -Os (2060 vs 2172); Rust outliner still full -32 KB (2060 -> 2092 without); C-outliner NO-OP via BOTH channels (linker -mllvm #104, CFLAGS -mllvm baked into bitcode #105) — Apple libLTO either already outlines or ignores it; -machine-outliner-threshold absent; IR-outliner/merge/global-merge/tail-merge no-ops; scheduler closed (-enable-post-misched=0 no-op, -misched=ilpmin +16 KB, linear/source invalid on aarch64).
 - **Terminal state**: binary_kb = 2060 KB (515 x 4KB blocks, sha 95376b54) certified through the real pipeline. Session total 5852 -> 2060 KB (-64.8%). All remaining levers still need user decision: crash-diagnostics flags (~-28 KB to ~2032 KB), reqwest fork (TLS 1.2 / platform-verifier), build-std (network).
+
+## Finding (#112) — corrected new-toolchain du boundary: 1,360 B (not 4 KB)
+
+- New-toolchain baseline file = **2,106,704 B** = 514.3 x 4 KB blocks (1,360 B into block 515).
+- Dropping the metric to 2056 KB requires removing **>= 1,360 B** of real content — NOT the 4 KB
+  boundary implied by the old-toolchain 1,973,328 B file (which needed 3,152 B).
+- Still unreachable in-scope: every >= 1,360 B lever is behavior-changing (fn-starts 12 KB,
+  compact_unwind 22 KB) or out-of-scope (TLS 1.2 fork ~30-40 KB, platform-verifier ~5-11 KB).
+- Also closed: -enable-misched=false (byte-neutral, sha change only) + -enable-tail-dup=false
+  (flag nonexistent in LLVM 22). Scheduler/tail-dup toggle dimension fully closed.
