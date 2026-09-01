@@ -110,6 +110,10 @@ deny 全部写与网络，再仅放行工作目录与 `TMPDIR` 两个 subpath �
 不可用则构造失败、清晰报错并退出，绝不静默降级为不隔离。与 `MYAGENT_RUNTIME`（local /
 nix）、`MYAGENT_READ_ONLY` 三方正交可组合，默认行为零变化。
 
+手动验证隔离效果（需在普通终端运行，嵌套沙箱环境会自动报错退出）：
+`./scripts/seatbelt-policy-test.sh`——直测 Seatbelt 策略（5 种写逃逸攻击
+均被拒、ROOT/TMPDIR 写入放行、网络默认关 / opt-in 放行）。
+
 ## Quick Start
 
 进入开发环境：
