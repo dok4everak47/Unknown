@@ -3,6 +3,7 @@ use crate::message::Message;
 use crate::model::{Model, ModelEvent, Response};
 use crate::runtime::{LocalRuntime, Runtime};
 use crate::tool::Tool;
+use crate::ui::Ui;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -22,8 +23,11 @@ const MAX_TOOL_ROUNDS: usize = 16;
 /// - 能力门拒绝：`🚫 <name> (permission denied)`；
 /// - test 构建下编译为空操作：fake model / mock server 集成测试不打印，
 ///   保持测试输出干净。
+///
+/// 着色经 `ui` 完成：🔧 行整条 dim（工具名 cyan）、🚫 行 red（工具名 bold）；
+/// 禁用时输出纯文本，与现状逐字一致。
 #[cfg(not(test))]
-fn tool_progress(name: &str, arguments: &serde_json::Value, allowed: bool) {
+fn tool_progress(ui: &Ui, name: &str, arguments: &serde_json::Value, allowed: bool) {
     if allowed {
         const MAX_CHARS: usize = 80;
         let args = arguments.to_string();
@@ -35,15 +39,15 @@ fn tool_progress(name: &str, arguments: &serde_json::Value, allowed: bool) {
         } else {
             args
         };
-        eprintln!("🔧 {name} {args}");
+        eprintln!("{}", ui.tool_allowed(name, &args));
     } else {
-        eprintln!("🚫 {name} (permission denied)");
+        eprintln!("{}", ui.tool_denied(name));
     }
 }
 
 /// test 构建下的空操作版本（保持测试输出干净）。
 #[cfg(test)]
-fn tool_progress(_name: &str, _arguments: &serde_json::Value, _allowed: bool) {}
+fn tool_progress(_ui: &Ui, _name: &str, _arguments: &serde_json::Value, _allowed: bool) {}
 
 /// Agent Loop 的致命错误。
 ///
@@ -194,12 +198,14 @@ impl<M: Model> Agent<M> {
         conversation: &mut Vec<Message>,
         user_text: &str,
     ) -> Result<(), AgentError> {
-        self.run_turn_streaming(conversation, user_text, &mut |_| {})
+        // 测试路径：不显示颜色，禁用着色开关（与现状纯文本一致）。
+        self.run_turn_streaming(conversation, user_text, &mut |_| {}, &Ui::new(false))
     }
 
     /// 处理一次用户输入（流式）：与 [`Agent::run_turn`] 逻辑逐字一致，
     /// 仅把模型调用换成 [`Model::complete_streaming`]，模型生成的文本增量
-    /// 经 `on_event` 实时发出，供 UI 逐字显示。
+    /// 经 `on_event` 实时发出，供 UI 逐字显示。`ui_stderr` 供工具进度行
+    /// （🔧/🚫）着色；禁用时输出纯文本，与现状逐字一致。
     ///
     /// 工具调用过程不产生文本事件；能力门、工具分发、轮数上限、回滚逻辑不变。
     pub fn run_turn_streaming(
@@ -207,6 +213,7 @@ impl<M: Model> Agent<M> {
         conversation: &mut Vec<Message>,
         user_text: &str,
         on_event: &mut dyn FnMut(ModelEvent),
+        ui_stderr: &Ui,
     ) -> Result<(), AgentError> {
         // 记录本回合开始的位置，出错时回滚到此处
         let turn_start = conversation.len();
@@ -234,8 +241,10 @@ impl<M: Model> Agent<M> {
                     for call in calls {
                         // 进度行（stderr）：能力门通过、真正执行前打印工具名与
                         // 参数摘要（🔧）；被能力门拒绝时打印拒绝标记（🚫）。
-                        // 多轮工具调用不再静默。test 构建下为 no-op。
+                        // 着色经 ui_stderr（禁用时纯文本）。多轮工具调用不再静默。
+                        // test 构建下为 no-op。
                         tool_progress(
+                            ui_stderr,
                             &call.name,
                             &call.arguments,
                             self.capabilities.allows(&call.name),
@@ -399,11 +408,16 @@ mod tests {
         let mut conversation = Vec::new();
         let mut deltas = Vec::new();
         agent
-            .run_turn_streaming(&mut conversation, "hi", &mut |event| match event {
-                ModelEvent::TextDelta(text) => deltas.push(text),
-                // 默认实现不产生推理事件；此处仅需穷尽枚举变体
-                ModelEvent::ReasoningDelta(_) => {}
-            })
+            .run_turn_streaming(
+                &mut conversation,
+                "hi",
+                &mut |event| match event {
+                    ModelEvent::TextDelta(text) => deltas.push(text),
+                    // 默认实现不产生推理事件；此处仅需穷尽枚举变体
+                    ModelEvent::ReasoningDelta(_) => {}
+                },
+                &Ui::new(false),
+            )
             .unwrap();
 
         // 默认实现把完整文本作为单个 delta 发出

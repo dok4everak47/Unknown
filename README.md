@@ -29,6 +29,7 @@ Nix
 - [x] Tool Calling（模型可发起工具调用）
 - [x] Streaming（SSE 流式输出：逐字显示回复，根治长请求被代理空闲超时掐断；读取空闲超时 120s 防静默挂起）
 - [x] 推理过程可选显示（`MYAGENT_SHOW_REASONING=1`：暗色 💭 前缀，仅展示、不进对话历史）
+- [x] 终端着色（ANSI 颜色层次：`You:` / `AI:` / 推理段 / 工具进度行 / 错误；`NO_COLOR` / `MYAGENT_NO_COLOR` 可关闭，非 tty 自动纯文本）
 - [x] `read_file` 工具
 - [x] `write_file` 工具
 - [x] `search` 工具
@@ -80,9 +81,10 @@ Final Response
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command`（exec 超时可配置，`MYAGENT_EXEC_TIMEOUT_SECS`） |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
 | `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`MYAGENT_SANDBOX` / `MYAGENT_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
-| `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试） |
+| `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试；工具进度行 🔧/🚫 经 `ui` 着色） |
+| `src/ui.rs` | 终端富文本 UI：`Ui` 结构体持有着色开关 + ANSI 样式方法（`dim`/`bold`/`green`/`cyan`/`red`/`yellow` 与组合），`color_enabled` 纯函数计算开关（`is_terminal` × `NO_COLOR` × `MYAGENT_NO_COLOR`），零依赖，可单测 |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
-| `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入（tty 下 rustyline 行编辑，非 tty 走 `BufRead::lines()`），创建 Model / Agent，显示结果 |
+| `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入（tty 下 rustyline 行编辑，非 tty 走 `BufRead::lines()`），创建 Model / Agent，启动时各计算一次 stdout/stderr 着色开关，显示结果 |
 
 ### 依赖方向
 
@@ -166,7 +168,29 @@ MYAGENT_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认�
 MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
 MYAGENT_EXEC_TIMEOUT_SECS=300 cargo run   # exec 超时调到 300s（默认 60s；冷构建/LTO 较慢时用）
 MYAGENT_SHOW_REASONING=1 cargo run   # 实时显示模型推理过程（暗色 💭，不进对话历史；默认关）
+NO_COLOR=1 cargo run                 # 禁用终端着色（任意值，按 no-color.org 约定；自动检测非 tty）
+MYAGENT_NO_COLOR=1 cargo run         # 项目自己的禁色开关（取值 1/true 关闭，与 NO_COLOR 作用相同）
 ```
+
+### 终端着色
+
+stdout / stderr 各自独立判断（`is_terminal()`）后启用 ANSI 着色（零新依赖，`src/ui.rs`）：
+
+- `You: ` 提示符：绿色加粗；`AI: ` 前缀：青色加粗；`error:` 标签：红色加粗
+- 工具进度行 `🔧`：整条暗色，工具名青色；被拒行 `🚫`：整条红色，工具名加粗
+- 推理段（`MYAGENT_SHOW_REASONING=1`）：暗色斜体（`💭` 前缀，结束复位）
+- 启动横幅 / `caused by` 链：暗色；`warning:`：黄色；致命错误：红色
+- 回答正文永远不着色（只给标签上色，保持克制）
+
+关闭方式（任一即可）：
+
+- 非 tty（管道 / 重定向 / 脚本）→ 自动纯文本，**输出逐字与历史版本一致**
+- `NO_COLOR` 设置（任意值，含空串，按 https://no-color.org）
+- `MYAGENT_NO_COLOR=1` / `MYAGENT_NO_COLOR=true`（大小写不敏感，可带空白）
+
+两者都读 `.env`；`NO_COLOR` 优先于 `MYAGENT_NO_COLOR`。rustyline 15 计算提示符
+宽度时会跳过 ANSI 转义序列（宽度视为 0）并把提示符原样写入终端，故着色提示符
+不会影响长行 / `←→` / `Ctrl+L` / 历史的换行与光标位置（已通过真实 pty 验证）。
 
 启动时会在 stderr 打印当前能力模式（`capabilities: full` / `capabilities: read-only`）
 与沙箱状态（`sandbox: on (network: off)` / `sandbox: on (network: ON)`），便于确认设置是否生效。

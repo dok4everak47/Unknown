@@ -8,6 +8,7 @@ mod runtime;
 mod sandbox;
 mod session;
 mod tool;
+mod ui;
 
 use crate::agent::Agent;
 use crate::capabilities::Capabilities;
@@ -15,6 +16,7 @@ use crate::message::Message;
 use crate::model::{Model, ModelEvent, OpenAICompatibleModel};
 use crate::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 use crate::session::Session;
+use crate::ui::{Ui, color_enabled};
 
 use rustyline::error::ReadlineError;
 use std::env;
@@ -132,81 +134,112 @@ fn show_reasoning_from(value: Option<String>) -> bool {
     }
 }
 
+/// 为一个输出流（stdout / stderr）计算着色开关（其各自的 `is_terminal()`）。
+///
+/// 须在 `load_dotenv` **之后**调用，使 `.env` 中的 `NO_COLOR` /
+/// `MYAGENT_NO_COLOR` 生效。风格对齐 `sandbox_mode()` / `show_reasoning_mode()`。
+fn build_ui(stream_is_terminal: bool) -> Ui {
+    Ui::new(color_enabled(
+        stream_is_terminal,
+        env::var("NO_COLOR").ok().as_deref(),
+        env::var("MYAGENT_NO_COLOR").ok().as_deref(),
+    ))
+}
+
 /// 处理一轮用户输入（tty / 非 tty 两条输入路径共用）：流式输出、错误链打印、
-/// 成功后保存 session。逻辑与原 turn 处理实现逐字一致。
-fn run_turn<M: Model>(agent: &Agent<M>, conversation: &mut Vec<Message>, path: &Path, text: &str) {
+/// 成功后保存 session。逻辑与原 turn 处理实现逐字一致；`ui_stdout` / `ui_stderr`
+/// 为着色开关（stdout 管 AI/You/推理，stderr 管工具/错误/warning），禁用时
+/// 输出与纯文本逐字一致。
+fn run_turn<M: Model>(
+    agent: &Agent<M>,
+    conversation: &mut Vec<Message>,
+    path: &Path,
+    text: &str,
+    ui_stdout: &Ui,
+    ui_stderr: &Ui,
+) {
     // 推理过程显示开关：MYAGENT_SHOW_REASONING=1/true 时，模型 reasoning_content
     // 以暗色 💭 前缀实时显示（仅"路过"展示，不进对话历史）；默认关，行为零变化。
     let show_reasoning = show_reasoning_mode();
     // 流式：收到第一个 TextDelta 时惰性打印 "AI: " 前缀，随后逐段输出并 flush；
     // 工具轮次期间（模型只发工具调用、无文本）不打印任何内容。
     let mut prefix_printed = false;
-    // 是否正处于暗色推理段（`\x1b[2m` 已打印、尚未复位）。
+    // 是否正处于暗色推理段（开场转义已打印、尚未复位）。
     let mut reasoning_active = false;
     let mut printed_any = false;
-    let result = agent.run_turn_streaming(conversation, text, &mut |event| {
-        match event {
-            ModelEvent::TextDelta(delta) => {
-                // 首个正式文本到来：若仍在暗色推理段，先复位 ANSI 并换行，
-                // 再打印正式回答前缀（暗色只包裹推理段，回答恢复常规样式）。
-                if reasoning_active {
-                    println!("\x1b[0m");
-                    reasoning_active = false;
+    let result = agent.run_turn_streaming(
+        conversation,
+        text,
+        &mut |event| {
+            match event {
+                ModelEvent::TextDelta(delta) => {
+                    // 首个正式文本到来：若仍在暗色推理段，先复位 ANSI 并换行，
+                    // 再打印正式回答前缀（暗色只包裹推理段，回答恢复常规样式）。
+                    if reasoning_active {
+                        println!("{}", ui_stdout.reset());
+                        reasoning_active = false;
+                    }
+                    if !prefix_printed {
+                        // 只给 "AI: " 标签着色，回答正文永远不着色。
+                        print!("{}", ui_stdout.cyan_bold("AI: "));
+                        prefix_printed = true;
+                    }
+                    print!("{delta}");
+                    printed_any = true;
+                    io::stdout()
+                        .flush()
+                        .expect("failed to flush stdout");
                 }
-                if !prefix_printed {
-                    print!("AI: ");
-                    prefix_printed = true;
+                ModelEvent::ReasoningDelta(delta) => {
+                    // 仅开关打开时显示；开关关闭时直接忽略（与现状一致）。
+                    if !show_reasoning || delta.is_empty() {
+                        return;
+                    }
+                    // 首个推理 chunk 惰性打印暗色（dim + italic）前缀 💭，
+                    // 随后逐段输出并 flush；开场转义不含 reset，deltas 延续暗色。
+                    if !reasoning_active {
+                        print!("{}💭 ", ui_stdout.reasoning_open());
+                        reasoning_active = true;
+                    }
+                    print!("{delta}");
+                    printed_any = true;
+                    io::stdout()
+                        .flush()
+                        .expect("failed to flush stdout");
                 }
-                print!("{delta}");
-                printed_any = true;
-                io::stdout()
-                    .flush()
-                    .expect("failed to flush stdout");
             }
-            ModelEvent::ReasoningDelta(delta) => {
-                // 仅开关打开时显示；开关关闭时直接忽略（与现状一致）。
-                if !show_reasoning || delta.is_empty() {
-                    return;
-                }
-                // 首个推理 chunk 惰性打印暗色前缀 💭，随后逐段输出并 flush。
-                if !reasoning_active {
-                    print!("\x1b[2m💭 ");
-                    reasoning_active = true;
-                }
-                print!("{delta}");
-                printed_any = true;
-                io::stdout()
-                    .flush()
-                    .expect("failed to flush stdout");
-            }
-        }
-    });
+        },
+        ui_stderr,
+    );
 
     match result {
         Ok(()) => {
             // 有增量输出则补换行（避免覆盖行内打字效果）；若本轮以推理段结束
             // （未迎来正式文本），先复位 ANSI 再换行，避免残色 / 粘连。
             if reasoning_active {
-                println!("\x1b[0m");
+                println!("{}", ui_stdout.reset());
             } else if printed_any {
                 println!();
             }
             // 每轮成功完成后保存；Model error 时 run_turn_streaming 已回滚，不保存半成品
             if let Err(err) = Session::save(path, conversation) {
-                eprintln!("failed to save session: {err}");
+                eprintln!(
+                    "{}",
+                    ui_stderr.yellow(&format!("failed to save session: {err}"))
+                );
             }
         }
         Err(err) => {
             // 已打印部分内容时先换行，避免错误信息粘在残句上；推理段同样先复位。
             if reasoning_active {
-                println!("\x1b[0m");
+                println!("{}", ui_stdout.reset());
             } else if printed_any {
                 println!();
             }
-            eprintln!("error: {err}");
+            eprintln!("{} {err}", ui_stderr.red_bold("error:"));
             let mut source = std::error::Error::source(&err);
             while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
+                eprintln!("{}", ui_stderr.dim(&format!("  caused by: {cause}")));
                 source = cause.source();
             }
         }
@@ -224,11 +257,16 @@ fn interactive_loop<M: Model>(
     conversation: &mut Vec<Message>,
     path: &Path,
     history_path: &Path,
+    ui_stdout: &Ui,
+    ui_stderr: &Ui,
 ) {
     let mut editor = match rustyline::DefaultEditor::new() {
         Ok(editor) => editor,
         Err(err) => {
-            eprintln!("failed to initialize line editor: {err}");
+            eprintln!(
+                "{}",
+                ui_stderr.red(&format!("failed to initialize line editor: {err}"))
+            );
             std::process::exit(1);
         }
     };
@@ -237,11 +275,19 @@ fn interactive_loop<M: Model>(
     if let Err(err) = editor.load_history(history_path)
         && !matches!(&err, ReadlineError::Io(e) if e.kind() == io::ErrorKind::NotFound)
     {
-        eprintln!("warning: failed to load history: {err}");
+        eprintln!(
+            "{} failed to load history: {err}",
+            ui_stderr.yellow("warning:")
+        );
     }
 
+    // 着色提示符：rustyline 15 计算提示符宽度时会跳过 ANSI 转义序列
+    // （src/tty/mod.rs::width 对转义返回 0 宽），并把提示符原样写入终端，
+    // 故着色不会干扰光标宽度计算（长行 / ←→ / Ctrl+L / 历史均不错位）。
+    // 禁用时返回纯文本 "You: "。
+    let prompt = ui_stdout.green_bold("You: ");
     loop {
-        match editor.readline("You: ") {
+        match editor.readline(&prompt) {
             Ok(line) => {
                 let text = line.trim();
                 if text == "/exit" {
@@ -254,7 +300,7 @@ fn interactive_loop<M: Model>(
                 if let Err(err) = editor.add_history_entry(line.as_str()) {
                     eprintln!("warning: failed to add history entry: {err}");
                 }
-                run_turn(agent, conversation, path, text);
+                run_turn(agent, conversation, path, text, ui_stdout, ui_stderr);
             }
             // Ctrl+C：放弃当前行，回到新提示符，不退出进程
             Err(ReadlineError::Interrupted) => {
@@ -264,7 +310,7 @@ fn interactive_loop<M: Model>(
             // Ctrl+D：退出循环（与 EOF 退出一致）
             Err(ReadlineError::Eof) => break,
             Err(err) => {
-                eprintln!("readline error: {err}");
+                eprintln!("{}", ui_stderr.red(&format!("readline error: {err}")));
                 break;
             }
         }
@@ -272,18 +318,29 @@ fn interactive_loop<M: Model>(
 
     // 退出时保存历史；失败仅告警，不中断会话。
     if let Err(err) = editor.save_history(history_path) {
-        eprintln!("warning: failed to save history: {err}");
+        eprintln!(
+            "{} failed to save history: {err}",
+            ui_stderr.yellow("warning:")
+        );
     }
 }
 
 /// 非 tty 模式（管道输入 / `</dev/null` / 脚本）：保持原有 `BufRead::lines()`
 /// 循环，不构造 rustyline Editor，行为与以前一致。
-fn noninteractive_loop<M: Model>(agent: &Agent<M>, conversation: &mut Vec<Message>, path: &Path) {
+fn noninteractive_loop<M: Model>(
+    agent: &Agent<M>,
+    conversation: &mut Vec<Message>,
+    path: &Path,
+    ui_stdout: &Ui,
+    ui_stderr: &Ui,
+) {
     let stdin = io::stdin();
     let mut input = stdin.lock().lines();
 
+    // 非 tty 路径：io_is_terminal=false → color_enabled 恒 false，提示符必为纯文本；
+    // ui_stderr 传 run_turn（其中 stderr 样式同样保持禁用），此处仅需保持签名对齐。
     loop {
-        print!("You: ");
+        print!("{}", ui_stdout.green_bold("You: "));
         io::stdout()
             .flush()
             .expect("failed to flush stdout");
@@ -301,20 +358,30 @@ fn noninteractive_loop<M: Model>(agent: &Agent<M>, conversation: &mut Vec<Messag
             continue;
         }
 
-        run_turn(agent, conversation, path, text);
+        run_turn(agent, conversation, path, text, ui_stdout, ui_stderr);
     }
 }
 
 fn main() {
     // 先加载 .env（工作目录）；真实环境变量优先，.env 仅兜底。
+    // .env 可能声明 NO_COLOR / MYAGENT_NO_COLOR，故着色开关须在加载之后计算。
     if let Err(err) = config::load_dotenv(std::path::Path::new(".env")) {
-        eprintln!("warning: failed to read .env: {err}");
+        // .env 读取失败时未注入任何变量，此处的 stderr UI 仅基于真实环境变量。
+        let stderr_ui = build_ui(io::stderr().is_terminal());
+        eprintln!(
+            "{} failed to read .env: {err}",
+            stderr_ui.yellow("warning:")
+        );
     }
+
+    // 着色开关：stdout（AI/You/推理）与 stderr（工具/横幅/错误/warning）各判断一次。
+    let ui_stdout = build_ui(io::stdout().is_terminal());
+    let ui_stderr = build_ui(io::stderr().is_terminal());
 
     let api_key = match env::var("OPENAI_API_KEY") {
         Ok(key) => key,
         Err(_) => {
-            eprintln!("OPENAI_API_KEY is not set!");
+            eprintln!("{}", ui_stderr.red("OPENAI_API_KEY is not set!"));
             std::process::exit(1);
         }
     };
@@ -328,7 +395,10 @@ fn main() {
         Ok(value) => match parse_exec_timeout(&value) {
             Ok(exec_timeout) => RuntimeConfig { exec_timeout },
             Err(msg) => {
-                eprintln!("MYAGENT_EXEC_TIMEOUT_SECS is invalid: {msg}");
+                eprintln!(
+                    "{}",
+                    ui_stderr.red(&format!("MYAGENT_EXEC_TIMEOUT_SECS is invalid: {msg}"))
+                );
                 std::process::exit(1);
             }
         },
@@ -339,7 +409,7 @@ fn main() {
     let runtime = match build_runtime(config.clone()) {
         Ok(runtime) => runtime,
         Err(msg) => {
-            eprintln!("{msg}");
+            eprintln!("{}", ui_stderr.red(&msg));
             std::process::exit(1);
         }
     };
@@ -354,16 +424,19 @@ fn main() {
         let root = match std::env::current_dir() {
             Ok(root) => root,
             Err(err) => {
-                eprintln!("failed to resolve working directory: {err}");
+                eprintln!(
+                    "{}",
+                    ui_stderr.red(&format!("failed to resolve working directory: {err}"))
+                );
                 std::process::exit(1);
             }
         };
         match crate::sandbox::SandboxedRuntime::new(&root, network, config.clone(), runtime) {
             Ok(runtime) => Box::new(runtime),
             Err(err) => {
-                eprintln!(
+                eprintln!("{}", ui_stderr.red(&format!(
                     "MYAGENT_SANDBOX=1 but failed to enable sandbox: {err}\n  Seatbelt sandbox requires macOS with /usr/bin/sandbox-exec"
-                );
+                )));
                 std::process::exit(1);
             }
         }
@@ -382,22 +455,32 @@ fn main() {
     let agent = match Agent::new_with_runtime_and_caps(model, runtime, capabilities) {
         Ok(agent) => agent,
         Err(err) => {
-            eprintln!("failed to initialize agent: {err}");
+            eprintln!(
+                "{}",
+                ui_stderr.red(&format!("failed to initialize agent: {err}"))
+            );
             std::process::exit(1);
         }
     };
 
-    // 启动横幅：当前能力模式，便于用户确认（与 MYAGENT_RUNTIME 正交可组合）。
-    eprintln!(
-        "capabilities: {}",
-        if read_only { "read-only" } else { "full" }
-    );
+    // 启动横幅：当前能力模式（整条 dim；read-only 状态值黄色提示，保持克制）。
+    let capabilities_line = if read_only {
+        format!("capabilities: {}", ui_stderr.yellow("read-only"))
+    } else {
+        "capabilities: full".to_string()
+    };
+    eprintln!("{}", ui_stderr.dim(&capabilities_line));
 
-    // 启动横幅：沙箱实际状态（启用时打印；与 MYAGENT_READ_ONLY 正交可组合）。
+    // 启动横幅：沙箱实际状态（整条 dim；network off 黄色提示，保持克制）。
     if sandbox {
+        let network = if sandbox_network() {
+            "ON".to_string()
+        } else {
+            ui_stderr.yellow("off")
+        };
         eprintln!(
-            "sandbox: on (network: {})",
-            if sandbox_network() { "ON" } else { "off" }
+            "{}",
+            ui_stderr.dim(&format!("sandbox: on (network: {network})"))
         );
     }
 
@@ -406,7 +489,10 @@ fn main() {
     let mut conversation = match Session::load(&path) {
         Ok(conversation) => conversation,
         Err(err) => {
-            eprintln!("failed to load session: {err}");
+            eprintln!(
+                "{}",
+                ui_stderr.red(&format!("failed to load session: {err}"))
+            );
             std::process::exit(1);
         }
     };
@@ -415,9 +501,16 @@ fn main() {
     // 非 tty（管道 / </dev/null / 脚本）走原有 BufRead::lines() 循环，行为不变。
     let history = history_path();
     if io::stdin().is_terminal() {
-        interactive_loop(&agent, &mut conversation, &path, &history);
+        interactive_loop(
+            &agent,
+            &mut conversation,
+            &path,
+            &history,
+            &ui_stdout,
+            &ui_stderr,
+        );
     } else {
-        noninteractive_loop(&agent, &mut conversation, &path);
+        noninteractive_loop(&agent, &mut conversation, &path, &ui_stdout, &ui_stderr);
     }
 }
 

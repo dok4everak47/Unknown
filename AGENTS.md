@@ -52,6 +52,7 @@ src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现�
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
 src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 macOS Seatbelt 沙箱（/usr/bin/sandbox-exec + SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 控制），文件操作委托内层 runtime
 src/session.rs   conversation 持久化（Session::load / Session::save）
+src/ui.rs        终端富文本 UI：Ui 结构体持有着色开关 + ANSI 样式方法（dim/bold/italic/green/cyan/red/yellow 及组合），color_enabled 纯函数计算开关（is_terminal × NO_COLOR × MYAGENT_NO_COLOR），零依赖、可单测；禁用时输出与纯文本逐字一致
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦；
