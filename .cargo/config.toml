@@ -1,6 +1,14 @@
 # Size-optimizing codegen flags for release binaries on aarch64 macOS.
 # Verified behavior-preserving: 102 tests pass, binary runs (see .auto/log.jsonl).
 #
+# The size-optimizing compiler/linker setup (Apple CommandLineTools clang for the
+# aws-lc C compile, Apple ld64 for the final link, their -flto CFLAGS, and the
+# devShell libiconv search path) is NOT hardcoded here. Those are machine-specific
+# and are injected by the nix devShell environment (see flake.nix), which resolves
+# every path dynamically. This file only keeps flags that are safe across every
+# environment: a plain `cargo build --release` outside the nix devShell still
+# builds (just without the size optimization).
+#
 # - machine outliner: factors repeated aarch64 instruction sequences (prologue/
 #   epilogue, constant loads) into shared out-of-line functions. Saves ~32 KB.
 #   -Oz does NOT enable this late pass by default (exp #21).
@@ -12,37 +20,12 @@
 #   a writable __DATA segment at runtime (no post-fixup read-only lockdown).
 #   Keeping the platform hardening feature is worth the 16 KB (0.8%).
 
-# Hide aws-lc (BoringSSL) C function visibility: the static lib's ~500 crypto
-# API symbols are currently exported in the LC_DYLD_EXPORTS_TRIE (17,912 B),
-# but nothing external links against this executable — they are dead metadata.
-# -fvisibility=hidden keeps them internally linkable (Rust FFI calls resolve
-# within the same image) while removing them from the export trie. Unlike
-# -no_exported_symbols (which broke proc-macro builds), this only touches the
-# aws-lc C compile. -Oz pinned so the C code stays size-optimized.
-# Compile the aws-lc (BoringSSL) C with Apple's CommandLineTools clang + -flto.
-# Apple clang's -flto IR LTOs ~16 KB smaller through ld64's libLTO than the
-# nix clang 21.1.8 IR (verified A/B: 2076 -> 2060 KB, behavior-preserving -
-# same C source, same -Oz/-flto; -fno-stack-check makes Apple clang match the
-# nix clang behavior of emitting no __chkstk stack-probe calls, which the nix
-# libLTO cannot consume from Apple bitcode: 'Unsupported stack probing method').
-#
-# Link with Apple's ld64 instead of nix cctools ld: Apple's libLTO emits
-# tighter __unwind_info (21,664 vs 23,872 B) + __eh_frame (37,752 vs 38,384 B)
-# for the same LTO'd content, and the smaller __TEXT segment rounds to a lower
-# 16 KB page boundary: binary_kb 2076 -> 2060 KB (verified A/B, debug/test
-# links fine, behavior-preserving). Apple ld64 needs the nix libiconv path via
-# -L (it does not search nix store paths) and rejects both the -Wl, prefix on
-# -no_exported_symbols (build.rs emits the bare flag) and -Wl,-mllvm (the C
-# outliner there is a no-op under Apple's libLTO anyway — A/B: 2060 either way).
-[env]
-CC = { value = "/Users/dok4ever/Project/Unknown/.cargo/cc-wrap.sh", force = true }
-CXX = { value = "/Library/Developer/CommandLineTools/usr/bin/clang++", force = true }
-CFLAGS = "-Oz -fvisibility=hidden -flto -fno-stack-check"
-
+# The Apple clang/ld64 size optimization was historically provided by the [env]
+# block and the `linker =` below (see git history). Since the config migration it
+# comes from the nix devShell environment variables (CC/CXX/CFLAGS and
+# CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER, see flake.nix); build.rs translates
+# MYAGENT_LIBICONV_LIB_DIR into a rustc link arg for ld64.
 [target.aarch64-apple-darwin]
-linker = "/Library/Developer/CommandLineTools/usr/bin/ld"
 rustflags = [
     "-C", "llvm-args=-enable-machine-outliner=always",
-    # Apple ld64 does not search nix store paths; give it the devShell's libiconv.
-    "-C", "link-arg=-L/nix/store/9mjprxvx6xj51qfg3bf7w8qiaknpmlk8-libiconv-1.19/lib",
 ]

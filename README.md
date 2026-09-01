@@ -223,6 +223,12 @@ cargo test
 cargo clippy
 ```
 
+> **Release 体积优化（2060 KB 地板）需要 `nix develop` + Apple Command Line Tools**：
+> devShell 会自动注入 Apple clang/ld64 与 libiconv 的配置（见 `flake.nix`）——aws-lc
+> 的 C 编译用 Apple clang 的 `-flto`，最终链接用 Apple ld64，把二进制压到 2060 KB。
+> 脱离 nix devShell 的普通 `cargo build --release` 可以正常构建，只是不做体积优化
+> （二进制更大）。
+
 测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `edit_file` / `exec` 的工具执行，Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限），session 的 save→load round-trip（含空/多轮/带 ToolCall 的 conversation）与损坏文件错误处理，以及 `OpenAICompatibleModel` ↔ Agent 的 mock-HTTP 集成测试（验证真实 provider 的请求序列化、ToolCall → 工具执行 → Tool Result 回传、API 错误传播，不依赖外部 LLM）。
 
 Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-collaboration.md)：默认一个 Agent 负责实现，另一个 Agent 只读审查，用户负责授权与合并。
