@@ -3,6 +3,7 @@ use crate::tool;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::BufRead;
+use std::time::Duration;
 
 /// 模型回复：要么是一段文本，要么是一组工具调用请求。
 #[derive(Debug, Clone, PartialEq)]
@@ -406,9 +407,37 @@ impl OpenAICompatibleModel {
     }
 }
 
+/// 连接阶段超时（共用）：连接建立挂死 10s 即报错，不无限等待。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 非流式请求整体超时：一次性请求-响应，120s 覆盖慢推理，挂死则失败。
+const COMPLETE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 构造 blocking HTTP 客户端（`complete` / `complete_streaming` 共用）。
+///
+/// 超时策略：
+/// - 共用 `connect_timeout(10s)`——连接建立阶段挂死不无限等；
+/// - 非流式 `complete` 额外传入 `overall_timeout`（整体请求上限 120s）；
+/// - 流式 `complete_streaming` 传 `None`——SSE 是长连接，**绝不设整体
+///   timeout**，整体 timeout 会按总时长误杀长推理（streaming 的设计就是
+///   靠持续字节保活）。
+///
+/// `build()` 失败（如 rustls 初始化）经 `?` 传播，不吞错。
+fn blocking_client(
+    overall_timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
+    let builder = reqwest::blocking::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    let builder = match overall_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    };
+    Ok(builder.build()?)
+}
+
 impl Model for OpenAICompatibleModel {
     fn complete(&self, messages: &[Message]) -> Result<Response, Box<dyn std::error::Error>> {
-        let client = reqwest::blocking::Client::new();
+        // 非流式：一次性请求-响应。共用连接超时 10s，外加整体超时 120s
+        // （覆盖慢推理；挂死则失败）。build() 失败经 `?` 传播。
+        let client = blocking_client(Some(COMPLETE_TIMEOUT))?;
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -484,7 +513,10 @@ impl Model for OpenAICompatibleModel {
         messages: &[Message],
         on_event: &mut dyn FnMut(ModelEvent),
     ) -> Result<Response, Box<dyn std::error::Error>> {
-        let client = reqwest::blocking::Client::new();
+        // 流式（SSE 长连接）：**只设连接超时 10s，绝不设整体 timeout**——
+        // 整体 timeout 会按总时长误杀长推理；streaming 的设计就是靠持续
+        // 字节保活。build() 失败经 `?` 传播。
+        let client = blocking_client(None)?;
 
         let request = ChatRequest {
             model: self.model.clone(),

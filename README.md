@@ -176,11 +176,16 @@ MYAGENT_EXEC_TIMEOUT_SECS=300 cargo run   # exec 超时调到 300s（默认 60s�
 
 ```text
 You: 请读取 src/main.rs，然后告诉我它做了什么。
-[tool] read_file {"path":"src/main.rs"}
+🔧 read_file {"path":"src/main.rs"}
 AI: src/main.rs 实现了……（基于文件内容的回答）
 
 You: /exit
 ```
+
+工具执行时 stderr 显示 🔧 进度行（如 `🔧 read_file {"path":"foo.nix"}`，参数压成
+单行并截断到约 80 字符；被能力门拒绝时显示 `🚫 <name> (permission denied)`），
+多轮工具调用不再静默。模型请求超时会明确报错：连接建立 10s / 非流式整体 120s
+（流式 SSE 长连接只设连接超时，不设整体 timeout），报错后可直接重试。
 
 退出方式：输入 `/exit`，或按 `Ctrl-D`（EOF）。
 

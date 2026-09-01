@@ -43,9 +43,9 @@ Final Response
 ```text
 src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session、REPL 行编辑：tty 下 rustyline——Ctrl+L 清屏 / ↑↓ 历史 / 行内编辑、`.myagent_history` 持久化，非 tty 走 BufRead::lines()）
 src/config.rs    .env 配置加载（KEY=VALUE；环境变量优先于 .env；纯 std 解析）
-src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试）
+src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试；工具调用分发处打 stderr 进度行 🔧/🚫，test 构建下 no-op）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
-src/model.rs     Model trait + OpenAI-compatible provider + SSE 流式（complete_streaming）
+src/model.rs     Model trait + OpenAI-compatible provider + SSE 流式（complete_streaming；blocking 客户端超时：连接 10s / 非流式整体 120s，流式不设整体 timeout）
 src/tool.rs      Tool 抽象 + read_file + write_file + search + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
 src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
 src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command（exec 超时可配置：RuntimeConfig，MYAGENT_EXEC_TIMEOUT_SECS，默认 60s）

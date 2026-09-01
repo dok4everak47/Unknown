@@ -15,6 +15,36 @@ use std::path::PathBuf;
 /// + 校验 + 修错）需要约 10+ 轮，故取 16。
 const MAX_TOOL_ROUNDS: usize = 16;
 
+/// 工具轮次进度行（仅生产构建）：执行前打到 stderr，让多轮工具调用可见。
+///
+/// - 能力门通过、真正执行前：`🔧 <name> <args>`——arguments 是 JSON 字符串，
+///   压成单行并截断到约 80 字符（避免 cargo 输出刷屏）；
+/// - 能力门拒绝：`🚫 <name> (permission denied)`；
+/// - test 构建下编译为空操作：fake model / mock server 集成测试不打印，
+///   保持测试输出干净。
+#[cfg(not(test))]
+fn tool_progress(name: &str, arguments: &serde_json::Value, allowed: bool) {
+    if allowed {
+        const MAX_CHARS: usize = 80;
+        let args = arguments.to_string();
+        let args: String = if args.chars().count() > MAX_CHARS {
+            args.chars()
+                .take(MAX_CHARS)
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            args
+        };
+        eprintln!("🔧 {name} {args}");
+    } else {
+        eprintln!("🚫 {name} (permission denied)");
+    }
+}
+
+/// test 构建下的空操作版本（保持测试输出干净）。
+#[cfg(test)]
+fn tool_progress(_name: &str, _arguments: &serde_json::Value, _allowed: bool) {}
+
 /// Agent Loop 的致命错误。
 ///
 /// 工具执行错误**不**属于此类：工具失败会作为 Tool Result 回传
@@ -202,6 +232,15 @@ impl<M: Model> Agent<M> {
 
                     conversation.push(Message::assistant_tool_calls(calls.clone()));
                     for call in calls {
+                        // 进度行（stderr）：能力门通过、真正执行前打印工具名与
+                        // 参数摘要（🔧）；被能力门拒绝时打印拒绝标记（🚫）。
+                        // 多轮工具调用不再静默。test 构建下为 no-op。
+                        tool_progress(
+                            &call.name,
+                            &call.arguments,
+                            self.capabilities.allows(&call.name),
+                        );
+
                         // 能力门：执行前检查，被拒时不触碰 Runtime，
                         // 拒绝作为 Tool Result 回传给 Model（与工具错误同一语义）。
                         let result = if !self.capabilities.allows(&call.name) {
