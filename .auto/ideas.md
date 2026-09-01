@@ -562,7 +562,7 @@ next steps — NOT to be done in autoresearch (features, need approval):
 - **Zero removable padding**: __TEXT header gap 952 B (ld64 hard minimum, headerpad flag only adds), __LINKEDIT perfectly contiguous, segments mandatory 16 KB (4 KB → SIGKILL), section gaps = alignment-mandatory.
 - **Closed with evidence (all 70)**: profile (opt=z/fat LTO/cgu=1/strip/abort), Rust LLVM passes, C-LTO passes, CFLAGS, linker flags (all), features (all deps minimal), sections/segments/signature/layout/padding/binding.
 - **Remaining levers = user decision only**:
-  1. Crash-diagnostics flags: `-Wl,-no_function_starts` + `-Wl,-no_compact_unwind` → **1896 KB** (or unwind-only 1908 KB, fn-starts-only 1916 KB) — degrades crash backtrace unwinding/function attribution. Needs explicit approval (build.rs line).
+  1. Crash-diagnostics flags: `-Wl,-no_function_starts` + `-Wl,-no_compact_unwind` → **2032 KB** in the NEW toolchain (old-toolchain numbers were 1896/1908/1916 KB — STALE). Re-quantified #109: fn-starts-only 2048 KB (-12 KB), unwind-only 2044 KB (-16 KB), combined 2032 KB (-28 KB). Combined binary verified runnable + codesign valid. Degrades crash backtrace unwinding/function attribution. Needs explicit approval (build.rs line).
   2. reqwest `[patch]`-fork: drop rustls-platform-verifier (est. tens KB + Security/CoreFoundation imports, changes CA trust to webpki roots) or drop tls12 (TLS 1.3-only).
   3. build-std: blocked by crates.io network (wasip1 uncached; std tree unresolvable). Needs registry access.
   4. ring TLS swap: new dependency, out of scope.
