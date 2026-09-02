@@ -527,18 +527,22 @@ trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 
 exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
 （`src/ssh_runtime.rs`）：
 
-- **零新依赖**：只调用系统 `ssh` 可执行文件（`std::process::Command`），不引入
-  ssh2 / openssh crate。`ssh -T -o BatchMode=yes -o ConnectTimeout=10
-  [-p PORT] [USER@]HOST -- <cmd>`：`-T` 不分配 pty（输出干净）；
+- **零新依赖 + 与登录 shell 解耦**：只调用系统 `ssh` 可执行文件
+  （`std::process::Command`），不引入 ssh2 / openssh crate。argv 固定为
+  `ssh -T -o BatchMode=yes -o ConnectTimeout=10 [-p PORT] [USER@]HOST -- sh -s`
+  （纯函数 `ssh_argv`，无 ssh 环境下可单元测试）：`-T` 不分配 pty（输出干净）；
   `BatchMode=yes` 绝不交互式提示密码（没配免密就快速失败，不挂住等输入）；
-  `--` 分隔 host 与远程命令（OpenSSH 消费该分隔符）。argv 构造为纯函数
-  `ssh_argv`（无 ssh 环境下可单元测试）。
+  `-- sh -s` 让远程登录 shell（bash/zsh/**fish** 任意）只负责执行 `sh -s`，
+  要跑的 **POSIX 脚本经 ssh 子进程 stdin 喂入**、由 POSIX sh 解析——因此远程
+  默认 shell 是 fish 也能正确执行 `for...do...done` 等 POSIX 语法（真机 fish
+  曾因登录 shell 直接解析 POSIX 脚本而失败，此为修复点）。`capture_remote`
+  `.stdin(piped())` 写入脚本后 drop 发 EOF；stdout/stderr 分离读取。
 - **路径映射**：`map_path`（纯函数）把本机绝对路径 `strip_prefix(local_root)`
   后 `join` 到 `remote_root`；不在本机 root 之下 → 拒绝。`local_root` 构造时
   canonicalize（macOS `/var` → `/private/var`）；`remote_root` 启动时经 ssh 解析
   （`MYAGENT_SSH_ROOT` 指定则 `cd '<root>' && pwd -P` 校验规范化，未指定则
   `pwd` 取远程 home）。工具层保证路径在本机 root 之内，映射失败正常不会发生。
-- **文件内容 base64 over the wire**：`read_file` 远程 `base64 -- <file>`（内容
+- **文件内容 base64 over the wire**：`read_file` 远程 `base64 -- <file>`（GNU coreutils 写法，目标 Linux 可用；macOS 远程需 `base64 -i`）（内容
   走 stdout，stderr 分离不污染）；`write_file` 本地 base64 后 `printf '%s' '…'
   | base64 -d > <file>`（base64 字符集仅 `[A-Za-z0-9+/=]`，无 shell 元字符，
   可安全放进远程命令）。自实现 base64 编解码（`b64_encode` / `b64_decode` 纯函数，
@@ -552,10 +556,11 @@ exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
 - **exec**：`cd '<remote_root>' && exec <program> <args...>`，cwd 固定为远程根
   （忽略入参）；program/args 已被工具白名单校验为安全字符集（无 shell 元字符），
   无需引用；ssh 透传远程退出码。
-- **构造探测**：`SshRuntime::new` 先 `ssh ... -- true` 探测连通性 + 免密（任何
-  失败 → 清晰 `io::Error`，提示检查 `MYAGENT_SSH_HOST` / `ssh-copy-id` /
-  网络防火墙），再解析远程根。`from_parts` 可注入自定义 ssh 二进制与 root 供测试
-  （对齐 `sandbox.rs` 的 `from_parts` / `for_test` 模式）。
+- **构造探测**：`SshRuntime::new` 先经 `ssh ... -- sh -s`（stdin 喂 `true`）
+  探测连通性 + 免密（任何失败 → 清晰 `io::Error`，提示检查 `MYAGENT_SSH_HOST` /
+  `ssh-copy-id` / 网络防火墙），再解析远程根。`from_parts` 可注入自定义 ssh 二进制
+  与 root 供测试（对齐 `sandbox.rs` 的 `from_parts` / `for_test` 模式）。gated
+  假-ssh 测试断言 argv 以 `-- sh -s` 结尾且脚本来自 stdin，防回归到登录 shell 解析。
 - **CLI**：`MYAGENT_RUNTIME=ssh` 启用；`MYAGENT_SSH_HOST` 必填（可含 `user@`），
   `MYAGENT_SSH_PORT` 默认 22（1..=65535，非法清晰报错），`MYAGENT_SSH_ROOT`
   默认远程 home。解析为纯函数 `ssh_host_from` / `parse_ssh_port`（`src/main.rs`，
