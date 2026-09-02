@@ -6,17 +6,23 @@
 //! [`map_path`] 映射为远程路径后，交给远程 shell 处理。
 //!
 //! ```text
-//! exec → ssh -T -o BatchMode=yes -o ConnectTimeout=10 [-p PORT] [USER@]HOST -- <remote cmd...>
+//! exec → ssh -T -o BatchMode=yes -o ConnectTimeout=10 [-p PORT] [USER@]HOST -- sh -s
+//!        ↑ 要跑的 POSIX 脚本经 ssh 子进程 stdin 喂入，写完关闭（发送 EOF）
 //! ```
 //!
 //! 设计要点：
+//! - **与登录 shell 解耦**：ssh argv 固定以 `-- sh -s` 结尾，远程 POSIX 脚本
+//!   经 ssh 子进程 stdin 喂入；外层登录 shell（fish/bash/zsh 任意）只负责
+//!   执行 `sh -s`，脚本一律由 POSIX sh 解析——不依赖登录 shell 语法
+//!   （真机 NixOS 登录 shell 为 fish 时，POSIX 写法如 `t=D`、`for...done`
+//!   若直接交给登录 shell 会报错）。
 //! - **零新依赖**：只调系统 `ssh` 可执行文件（`std::process::Command`），
 //!   不引入 ssh2 / openssh crate。
 //! - **绝不交互式提示密码**：`BatchMode=yes` 下没配免密就快速失败，而不是
 //!   挂住等输入（配免密：`ssh-copy-id <user>@<host>`）。
 //! - 文件内容走 **base64 over the wire**：避免 stdout/stderr 合并污染内容、
 //!   避免引号/换行/二进制问题；本地自实现 base64 编解码（字符集仅
-//!   `[A-Za-z0-9+/=]`，无 shell 元字符，可安全放进远程命令）。
+//!   `[A-Za-z0-9+/=]`，无 shell 元字符，可安全写进远程脚本）。
 //! - 文件原语需要 **stdout 与 stderr 分离**（内容不能被 stderr 污染），exec
 //!   需要**合并**（对齐 `LocalRuntime` exec 语义）：模块内自带一个与
 //!   `runtime::run_command` 同样超时轮询模式的私有 captured-run 辅助，不改动
@@ -29,7 +35,7 @@
 //! 一般在 `~/.bashrc`，sshd 非交互会 source）；若远程报
 //! `cargo: command not found`，需确保 cargo 在远程 PATH。
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -82,9 +88,10 @@ impl SshRuntime {
         port: u16,
         remote_root: Option<&Path>,
     ) -> io::Result<Self> {
-        // 1. 连通性 + 免密探测：`ssh ... -- true`（BatchMode=yes 绝不提示密码）
-        let probe = ssh_argv(host, port, &["true".to_string()]);
-        match capture_remote(&probe, config.exec_timeout) {
+        // 1. 连通性 + 免密探测：`ssh ... -- sh -s`，stdin 喂脚本 `true`
+        //    （BatchMode=yes 绝不提示密码）
+        let probe = ssh_argv(host, port);
+        match capture_remote(&probe, "true", config.exec_timeout) {
             Ok(out) if out.code == 0 => {}
             Ok(out) => {
                 return Err(io::Error::other(format!(
@@ -112,9 +119,9 @@ impl SshRuntime {
         //    没设就 pwd 取远程 home 作为远程根（ssh 非交互默认落在 $HOME）。
         let remote_root = match remote_root {
             Some(root) => {
-                let cmd = format!("cd {} && pwd -P", sh_quote(&root.display().to_string()));
-                let argv = ssh_argv(host, port, &[cmd]);
-                match capture_remote(&argv, config.exec_timeout) {
+                let script = format!("cd {} && pwd -P", sh_quote(&root.display().to_string()));
+                let argv = ssh_argv(host, port);
+                match capture_remote(&argv, &script, config.exec_timeout) {
                     Ok(out) if out.code == 0 => PathBuf::from(out.stdout.trim()),
                     Ok(out) => {
                         return Err(io::Error::other(format!(
@@ -139,8 +146,8 @@ impl SshRuntime {
                 }
             }
             None => {
-                let argv = ssh_argv(host, port, &["pwd".to_string()]);
-                match capture_remote(&argv, config.exec_timeout) {
+                let argv = ssh_argv(host, port);
+                match capture_remote(&argv, "pwd", config.exec_timeout) {
                     Ok(out) if out.code == 0 => PathBuf::from(out.stdout.trim()),
                     Ok(out) => {
                         return Err(io::Error::other(format!(
@@ -211,16 +218,18 @@ impl SshRuntime {
         map_path(path, &self.local_root, &self.remote_root)
     }
 
-    /// 构造完整 ssh argv（把注入的 ssh 二进制换成 `self.ssh_bin`）。
-    fn argv(&self, remote_cmd: &[String]) -> Vec<String> {
-        let mut argv = ssh_argv(&self.host, self.port, remote_cmd);
+    /// 构造完整 ssh argv（固定以 `-- sh -s` 结尾；把注入的 ssh 二进制换成
+    /// `self.ssh_bin`）。
+    fn argv(&self) -> Vec<String> {
+        let mut argv = ssh_argv(&self.host, self.port);
         argv[0] = self.ssh_bin.clone();
         argv
     }
 
-    /// 跑一次 ssh 远程命令（stdout/stderr 分离捕获，带超时轮询）。
-    fn capture(&self, argv: &[String]) -> Result<RemoteOutput, ExecError> {
-        capture_remote(argv, self.config.exec_timeout)
+    /// 把 POSIX 脚本经 stdin 喂给 `ssh ... -- sh -s` 执行（stdout/stderr
+    /// 分离捕获，带超时轮询）。
+    fn capture(&self, script: &str) -> Result<RemoteOutput, ExecError> {
+        capture_remote(&self.argv(), script, self.config.exec_timeout)
     }
 }
 
@@ -228,10 +237,10 @@ impl Runtime for SshRuntime {
     fn read_file(&self, path: &Path) -> io::Result<String> {
         let remote = self.map_path(path)?;
         // 远程 base64 编码到 stdout；stderr 分离（不污染内容）。
-        let cmd = format!("base64 -- {}", sh_quote(&remote.display().to_string()));
-        let out = self
-            .capture(&self.argv(&[cmd]))
-            .map_err(io_from_exec)?;
+        // 保持 GNU 写法 `base64 -- <path>`（目标为 Linux）；macOS 远程需改用
+        // `base64 -i <path>`（BSD base64 不识别 `--`）。
+        let script = format!("base64 -- {}", sh_quote(&remote.display().to_string()));
+        let out = self.capture(&script).map_err(io_from_exec)?;
         if out.code != 0 {
             let stderr = out.stderr.trim();
             let msg = if stderr.is_empty() {
@@ -257,15 +266,13 @@ impl Runtime for SshRuntime {
         // base64 字符集仅 [A-Za-z0-9+/=]，无 shell 元字符，可安全进 argv。
         let b64 = b64_encode(content.as_bytes());
         let dir = remote.parent().unwrap_or(&remote);
-        let cmd = format!(
+        let script = format!(
             "mkdir -p {} && printf '%s' '{}' | base64 -d > {}",
             sh_quote(&dir.display().to_string()),
             b64,
             sh_quote(&remote.display().to_string())
         );
-        let out = self
-            .capture(&self.argv(&[cmd]))
-            .map_err(io_from_exec)?;
+        let out = self.capture(&script).map_err(io_from_exec)?;
         if out.code != 0 {
             let stderr = out.stderr.trim();
             let msg = if stderr.is_empty() {
@@ -287,9 +294,7 @@ impl Runtime for SshRuntime {
              else t=O; fi; printf '%s\\t%s\\n' \"$t\" \"$f\"; done",
             sh_quote(&remote.display().to_string())
         );
-        let out = self
-            .capture(&self.argv(&[script]))
-            .map_err(io_from_exec)?;
+        let out = self.capture(&script).map_err(io_from_exec)?;
         if out.code != 0 {
             let stderr = out.stderr.trim();
             let msg = if stderr.is_empty() {
@@ -306,15 +311,15 @@ impl Runtime for SshRuntime {
         // 远程：cd '<remote_root>' && exec <program> <args...>。
         // program/args 已被工具白名单校验为安全字符集（无 shell 元字符），
         // 无需引用；ssh 透传远程命令退出码。cwd 固定为 remote_root（忽略入参）。
-        let mut cmd = format!(
+        let mut script = format!(
             "cd {} && exec {program}",
             sh_quote(&self.remote_root.display().to_string())
         );
         for arg in args {
-            cmd.push(' ');
-            cmd.push_str(arg);
+            script.push(' ');
+            script.push_str(arg);
         }
-        let out = self.capture(&self.argv(&[cmd]))?;
+        let out = self.capture(&script)?;
         Ok(ExecOutput {
             code: out.code,
             output: merge_output(&out.stdout, &out.stderr),
@@ -322,7 +327,7 @@ impl Runtime for SshRuntime {
     }
 }
 
-/// 构造 `ssh -T -o BatchMode=yes -o ConnectTimeout=10 [-p PORT] [USER@]HOST -- <remote cmd...>`
+/// 构造 `ssh -T -o BatchMode=yes -o ConnectTimeout=10 [-p PORT] [USER@]HOST -- sh -s`
 /// 的 argv（**纯函数**，便于无 ssh 环境下单测）。
 ///
 /// - `-T`：不分配 pty（输出干净）；
@@ -330,8 +335,11 @@ impl Runtime for SshRuntime {
 /// - `ConnectTimeout=10`：连接超时；
 /// - `port != 22` 时才加 `-p <port>`（默认端口不加）；
 /// - `--` 分隔 host 与远程命令（OpenSSH 会消费该分隔符，不传给远程 shell）；
-/// - `host` 可含 `user@` 也可不含，原样透传。
-pub fn ssh_argv(host: &str, port: u16, remote_cmd: &[String]) -> Vec<String> {
+/// - `host` 可含 `user@` 也可不含，原样透传；
+/// - 固定以 `sh -s` 结尾：远程脚本一律经 ssh 子进程 **stdin** 喂入（见
+///   [`capture_remote`]），登录 shell 只执行 `sh -s`，脚本由 POSIX sh 解析，
+///   与登录 shell（fish/bash/zsh）无关。
+pub fn ssh_argv(host: &str, port: u16) -> Vec<String> {
     let mut argv = vec![
         "ssh".to_string(),
         "-T".to_string(),
@@ -346,7 +354,8 @@ pub fn ssh_argv(host: &str, port: u16, remote_cmd: &[String]) -> Vec<String> {
     }
     argv.push(host.to_string());
     argv.push("--".to_string());
-    argv.extend(remote_cmd.iter().cloned());
+    argv.push("sh".to_string());
+    argv.push("-s".to_string());
     argv
 }
 
@@ -407,15 +416,32 @@ struct RemoteOutput {
 /// 私有 captured-run 辅助：与 `runtime::run_command` 同样的超时轮询模式，
 /// 但 **stdout / stderr 分离捕获**（文件内容不能被 stderr 污染）。
 ///
+/// `script` 为要执行的 POSIX 脚本：写入子进程 stdin 后关闭（发送 EOF），由
+/// 远程 `sh -s` 解析执行——登录 shell 只跑 `sh -s`，脚本与登录 shell 无关。
+/// 远程提前退出（连接被拒 / 探测失败）时写入会 BrokenPipe，忽略即可，成败
+/// 交由退出码轮询判定。
+///
 /// 不修改 `runtime.rs` 里共享 `run_command` 的签名；exec 需要合并输出时由
 /// 调用方用 [`merge_output`] 合并。
-fn capture_remote(argv: &[String], timeout: Duration) -> Result<RemoteOutput, ExecError> {
+fn capture_remote(
+    argv: &[String],
+    script: &str,
+    timeout: Duration,
+) -> Result<RemoteOutput, ExecError> {
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(ExecError::Io)?;
+
+    // 把 POSIX 脚本写入 stdin，随后 drop 发送 EOF。远程提前退出（连接被拒 /
+    // 探测失败）时写入会 BrokenPipe：忽略，交由退出码轮询判定成败。
+    if let Some(mut stdin) = child.stdin.take() {
+        // 写失败（常见于远程提前退出的 BrokenPipe）不影响后续轮询判定。
+        let _ = stdin.write_all(script.as_bytes());
+    }
 
     // 先接管 stdout/stderr，避免子进程输出写满管道时阻塞
     let stdout = child.stdout.take().expect("stdout piped");
@@ -598,42 +624,46 @@ mod tests {
     /// host 带或不带 user@ 均原样透传。
     #[test]
     fn ssh_argv_basic_form() {
-        let argv = ssh_argv("dok@192.168.64.11", 22, &["true".to_string()]);
+        let argv = ssh_argv("dok@192.168.64.11", 22);
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"-T".to_string()));
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"ConnectTimeout=10".to_string()));
         assert!(argv.contains(&"dok@192.168.64.11".to_string()));
         assert!(argv.contains(&"--".to_string()));
-        assert!(argv.ends_with(&["--".to_string(), "true".to_string()]));
+        // 固定以 -- sh -s 结尾：登录 shell 只执行 sh -s，脚本经 stdin 喂入
+        assert!(argv.ends_with(&["--".to_string(), "sh".to_string(), "-s".to_string()]));
         // 默认端口 22：不加 -p
         assert!(!argv.contains(&"-p".to_string()));
     }
 
     #[test]
     fn ssh_argv_without_user() {
-        let argv = ssh_argv("192.168.64.11", 22, &["true".to_string()]);
+        let argv = ssh_argv("192.168.64.11", 22);
         assert!(argv.contains(&"192.168.64.11".to_string()));
         assert!(!argv.contains(&"-p".to_string()));
     }
 
     #[test]
     fn ssh_argv_non_default_port_adds_p() {
-        let argv = ssh_argv("dok@192.168.64.11", 2222, &["true".to_string()]);
+        let argv = ssh_argv("dok@192.168.64.11", 2222);
         let p = argv
             .iter()
             .position(|a| a == "-p")
             .expect("-p present");
         assert_eq!(argv[p + 1], "2222");
-        // 远程命令仍以 -- 开头
+        // -- 之后固定是 sh -s（脚本经 stdin 喂入，不进 argv）
         let ddash = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[ddash + 1..], &["true".to_string()]);
+        assert_eq!(&argv[ddash + 1..], &["sh".to_string(), "-s".to_string()]);
     }
 
+    /// ssh argv 固定以 -- sh -s 结尾；-- 之后不再有任何命令文本（脚本走 stdin）。
     #[test]
-    fn ssh_argv_multiple_remote_args() {
-        let argv = ssh_argv("h", 22, &["echo".to_string(), "hi".to_string()]);
-        assert!(argv.ends_with(&["--".to_string(), "echo".to_string(), "hi".to_string()]));
+    fn ssh_argv_ends_with_sh_s() {
+        let argv = ssh_argv("h", 22);
+        let ddash = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[ddash + 1..], &["sh".to_string(), "-s".to_string()]);
+        assert!(argv.ends_with(&["--".to_string(), "sh".to_string(), "-s".to_string()]));
     }
 
     /// sh_quote：普通 / 空格 / 单引号 / 空串。
@@ -783,47 +813,68 @@ mod tests {
     #[cfg(unix)]
     fn write_fake_ssh(local_backing: &Path, remote_root: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let mut s = String::new();
-        s.push_str("#!/usr/bin/env bash\nset -uo pipefail\n");
-        s.push_str("REMOTE_ROOT='");
-        s.push_str(remote_root);
-        s.push_str("'\nLOCAL_ROOT='");
-        s.push_str(&local_backing.display().to_string());
-        s.push_str("'\ndeclare -a cmd=()\ndeclare after=false\n");
-        s.push_str("for a in \"$@\"; do\n  if [[ \"$after\" == true ]]; then cmd+=(\"$a\"); continue; fi\n");
-        s.push_str("  if [[ \"$a\" == \"--\" ]]; then after=true; continue; fi\ndone\n");
-        s.push_str("CMD=\"${cmd[*]}\"\n");
-        s.push_str("map() { local p=\"$1\"; if [[ \"$p\" == \"$REMOTE_ROOT\"* ]]; then echo \"${LOCAL_ROOT}${p#\"$REMOTE_ROOT\"}\"; else echo \"$p\"; fi; }\n");
-        s.push_str("if [[ \"$CMD\" == \"true\" ]]; then exit 0; fi\n");
-        s.push_str("if [[ \"$CMD\" == \"pwd\" ]]; then echo \"$REMOTE_ROOT\"; exit 0; fi\n");
-        s.push_str("if [[ \"$CMD\" == cd\\ * && \"$CMD\" == *\"pwd -P\"* ]]; then\n");
-        s.push_str("  d=$(sed -n \"s|^cd '\\([^']*\\)' && pwd -P$|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  m=$(map \"$d\")\n  if [[ ! -d \"$m\" ]]; then echo \"cd: $d: No such file or directory\" >&2; exit 1; fi\n");
-        s.push_str("  echo \"$d\"; exit 0\nfi\n");
-        s.push_str("if [[ \"$CMD\" == base64\\ * ]]; then\n");
-        s.push_str("  p=$(sed -n \"s|^base64 -- '\\([^']*\\)'$|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  m=$(map \"$p\")\n  if [[ ! -f \"$m\" ]]; then echo \"base64: $p: No such file or directory\" >&2; exit 1; fi\n");
-        s.push_str("  base64 \"$m\"; exit 0\nfi\n");
-        s.push_str("if [[ \"$CMD\" == mkdir\\ * && \"$CMD\" == *\"printf '%s'\"* ]]; then\n");
-        s.push_str("  d=$(sed -n \"s|^mkdir -p '\\([^']*\\)'.*|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  b64=$(sed -n \"s|.*printf '%s' '\\([^']*\\)'.*|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  p=$(sed -n \"s|.*> '\\([^']*\\)'$|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  mkdir -p \"$(map \"$d\")\"\n");
-        s.push_str("  printf '%s' \"$b64\" | base64 -d > \"$(map \"$p\")\"\n  exit 0\nfi\n");
-        s.push_str("if [[ \"$CMD\" == cd\\ * && \"$CMD\" == *\"for f in\"* ]]; then\n");
-        s.push_str("  d=$(sed -n \"s|^cd '\\([^']*\\)' && for .*|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  m=$(map \"$d\")\n  if [[ ! -d \"$m\" ]]; then echo \"cd: $d: No such file or directory\" >&2; exit 1; fi\n");
-        s.push_str("  (cd \"$m\" && for f in * .[!.]* ..?*; do [ -e \"$f\" ] || [ -L \"$f\" ] || continue; if [ -d \"$f\" ]; then t=D; elif [ -L \"$f\" ]; then t=L; elif [ -f \"$f\" ]; then t=F; else t=O; fi; printf '%s\\t%s\\n' \"$t\" \"$f\"; done)\n");
-        s.push_str("  exit 0\nfi\n");
-        s.push_str("if [[ \"$CMD\" == cd\\ * && \"$CMD\" == *\"exec cargo\"* ]]; then\n");
-        s.push_str("  r=$(sed -n \"s|^cd '\\([^']*\\)' && exec .*|\\1|p\" <<<\"$CMD\")\n");
-        s.push_str("  m=$(map \"$r\")\n  cd \"$m\" 2>/dev/null || { echo \"cd: $r: No such file or directory\" >&2; exit 1; }\n");
-        s.push_str("  if [[ \"$CMD\" == *\"--should-fail\"* ]]; then\n");
-        s.push_str("    echo \"error: simulated compile failure\" >&2\n    exit 101\n  fi\n");
-        s.push_str("  echo \"    Checking myagent-ssh-fixture v0.1.0\"\n");
-        s.push_str("  echo \"    Finished \\`check\\` profile [unoptimized + debuginfo] target(s) in 0.01s\"\n");
-        s.push_str("  echo ran >> cargo-ran.txt\n  exit 0\nfi\n");
-        s.push_str("echo \"fake-ssh: unrecognized command: $CMD\" >&2\nexit 2\n");
+        // 假 ssh：断言 argv 以 `-- sh -s` 结尾 + 脚本来自 stdin，然后把远程根
+        // 改写为本地 backing、交由真实 POSIX sh 执行——端到端验证 SshRuntime
+        // 的命令构造不依赖登录 shell 语法（回归保护：曾把 POSIX 脚本直接拼进
+        // argv 交给登录 shell，fish 下 `t=D` 会报错）。
+        let s = format!(
+            r#"#!/usr/bin/env bash
+set -uo pipefail
+REMOTE_ROOT='{remote_root}'
+LOCAL_ROOT='{local_backing}'
+
+# --- ① 断言 argv 固定以 -- sh -s 结尾（登录 shell 只执行 sh -s） ---
+n=$#
+if [[ $n -lt 3 || "${{@:$((n-2)):1}}" != "--" || "${{@:$((n-1)):1}}" != "sh" || "${{@:$n:1}}" != "-s" ]]; then
+  echo "fake-ssh: argv must end with '-- sh -s' (got: $*)" >&2
+  exit 2
+fi
+
+# --- ② 脚本必须来自 stdin（不能把命令拼进 argv） ---
+script=$(cat)
+if [[ -z "$script" ]]; then
+  echo "fake-ssh: expected script on stdin (got empty)" >&2
+  exit 2
+fi
+
+# --- SshRuntime::new 的连通性 / 远程根解析 ---
+case "$script" in
+  true) exit 0 ;;
+  pwd) echo "$REMOTE_ROOT"; exit 0 ;;
+esac
+if [[ "$script" == cd\ * && "$script" == *"&& pwd -P" ]]; then
+  d=$(sed -n "s|^cd '\([^']*\)' && pwd -P$|\1|p" <<<"$script")
+  m=${{d/$REMOTE_ROOT/$LOCAL_ROOT}}
+  if [[ ! -d "$m" ]]; then echo "cd: $d: No such file or directory" >&2; exit 1; fi
+  echo "$d"; exit 0
+fi
+
+# --- exec（cargo）按行为模拟（脚本仍经 sh -s + stdin 喂入） ---
+if [[ "$script" == cd\ * && "$script" == *"exec cargo"* ]]; then
+  r=$(sed -n "s|^cd '\([^']*\)' && exec .*|\1|p" <<<"$script")
+  m=${{r/$REMOTE_ROOT/$LOCAL_ROOT}}
+  cd "$m" 2>/dev/null || {{ echo "cd: $r: No such file or directory" >&2; exit 1; }}
+  if [[ "$script" == *"--should-fail"* ]]; then
+    echo "error: simulated compile failure" >&2
+    exit 101
+  fi
+  echo "    Checking myagent-ssh-fixture v0.1.0"
+  echo "    Finished \`check\` profile [unoptimized + debuginfo] target(s) in 0.01s"
+  echo ran >> cargo-ran.txt
+  exit 0
+fi
+
+# --- 其余（read_file / write_file / read_dir）：把远程根改写为本地 backing，
+# --- 再交由真实 POSIX sh 执行——验证脚本由 POSIX sh 解析，与登录 shell 无关。
+rewritten=${{script//"'$REMOTE_ROOT"/"'$LOCAL_ROOT"}}
+# 本地 base64 未必支持 GNU 的 --（macOS/BSD 需 -i），剥掉 -- 以便本地执行
+rewritten=${{rewritten//"base64 -- "/"base64 "}}
+sh -c "$rewritten"
+exit $?
+"#,
+            remote_root = remote_root,
+            local_backing = local_backing.display()
+        );
         let path = local_backing.join("fake-ssh");
         fs::write(&path, s).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
