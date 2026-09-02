@@ -7,6 +7,7 @@ mod nix_runtime;
 mod runtime;
 mod sandbox;
 mod session;
+mod ssh_runtime;
 mod tool;
 mod ui;
 
@@ -16,6 +17,7 @@ use crate::message::Message;
 use crate::model::{Model, ModelEvent, OpenAICompatibleModel};
 use crate::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 use crate::session::Session;
+use crate::ssh_runtime::SshRuntime;
 use crate::ui::{Ui, color_enabled};
 
 use rustyline::error::ReadlineError;
@@ -45,11 +47,22 @@ fn history_path() -> PathBuf {
     history_path_from(env::var("MYAGENT_HISTORY").ok())
 }
 
-/// 工具执行 Runtime 的选择：`MYAGENT_RUNTIME=local`（默认）/ `nix`。
+/// SSH Runtime 的启动横幅信息（主机 + 远程根），供 `main` 打印状态。
+struct SshBanner {
+    /// 连接目标（可含 `user@`）。
+    host: String,
+    /// 远程项目根（canonicalize 后的规范绝对路径）。
+    remote_root: PathBuf,
+}
+
+/// 工具执行 Runtime 的选择：`MYAGENT_RUNTIME=local`（默认）/ `nix` / `ssh`。
 ///
-/// 返回 `Err(String)` 表示配置无效或 nix 不可用，调用方据此清晰报错并 exit 1。
-/// `config` 携带执行参数（当前只有 exec 超时），传给选中的 Runtime。
-fn build_runtime(config: RuntimeConfig) -> Result<Box<dyn Runtime>, String> {
+/// 返回 `(runtime, Option<SshBanner>)`；ssh 时 `Some(banner)`（供启动横幅显示
+/// 主机与远程根），其余为 `None`。
+///
+/// 返回 `Err(String)` 表示配置无效或 nix / ssh 不可用，调用方据此清晰报错并
+/// exit 1。`config` 携带执行参数（当前只有 exec 超时），传给选中的 Runtime。
+fn build_runtime(config: RuntimeConfig) -> Result<(Box<dyn Runtime>, Option<SshBanner>), String> {
     let value = match env::var("MYAGENT_RUNTIME") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => "local".to_string(),
@@ -59,17 +72,76 @@ fn build_runtime(config: RuntimeConfig) -> Result<Box<dyn Runtime>, String> {
     };
 
     match value.as_str() {
-        "local" => Ok(Box::new(LocalRuntime::new(config))),
+        "local" => Ok((Box::new(LocalRuntime::new(config)), None)),
         "nix" => match crate::nix_runtime::NixRuntime::new(config) {
-            Ok(runtime) => Ok(Box::new(runtime)),
+            Ok(runtime) => Ok((Box::new(runtime), None)),
             Err(err) => Err(format!(
                 "MYAGENT_RUNTIME=nix but nix is not available: {err}\n  install nix (https://nixos.org/download) or use MYAGENT_RUNTIME=local"
             )),
         },
+        "ssh" => {
+            // 主机（必填）：MYAGENT_SSH_HOST，可含 user@；缺失/非法 → 清晰报错。
+            let host = match ssh_host_from(env::var("MYAGENT_SSH_HOST").ok()) {
+                Ok(host) => host,
+                Err(msg) => {
+                    return Err(format!("MYAGENT_RUNTIME=ssh but {msg}"));
+                }
+            };
+            // 端口：MYAGENT_SSH_PORT（可选，默认 22）；非法 → 清晰报错。
+            let port = match env::var("MYAGENT_SSH_PORT") {
+                Ok(value) => match parse_ssh_port(&value) {
+                    Ok(port) => port,
+                    Err(msg) => return Err(format!("MYAGENT_SSH_PORT is invalid: {msg}")),
+                },
+                Err(_) => 22,
+            };
+            // 远程根：MYAGENT_SSH_ROOT（可选，默认远程 home）。
+            let remote_root = env::var("MYAGENT_SSH_ROOT")
+                .ok()
+                .map(PathBuf::from);
+            match SshRuntime::new(config, &host, port, remote_root.as_deref()) {
+                Ok(runtime) => {
+                    let banner = SshBanner {
+                        host,
+                        remote_root: runtime.remote_root().to_path_buf(),
+                    };
+                    Ok((Box::new(runtime), Some(banner)))
+                }
+                Err(err) => Err(format!("MYAGENT_RUNTIME=ssh failed to initialize: {err}")),
+            }
+        }
         other => Err(format!(
-            "unknown MYAGENT_RUNTIME value: {other:?} (expected \"local\" or \"nix\")"
+            "unknown MYAGENT_RUNTIME value: {other:?} (expected \"local\", \"nix\", or \"ssh\")"
         )),
     }
+}
+
+/// 解析 `MYAGENT_SSH_HOST`：缺失 / 空串 → `Err`；合法则原样返回
+/// （可含 `user@` 前缀，如 `dok@192.168.64.11`）。
+///
+/// 纯函数（不读 env、无副作用），便于单元测试。
+fn ssh_host_from(value: Option<String>) -> Result<String, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(
+            "MYAGENT_SSH_HOST is not set; set it to the remote host (optionally user@host)"
+                .to_string(),
+        ),
+    }
+}
+
+/// 解析 `MYAGENT_SSH_PORT`：1..=65535 的整数 → `Ok`；否则 → `Err`。
+///
+/// 纯函数（不读 env、无副作用），便于单元测试。
+fn parse_ssh_port(value: &str) -> Result<u16, String> {
+    let port: u16 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{value:?} is not a valid port number (1-65535)"))?;
+    if port == 0 {
+        return Err(format!("{value:?} is 0; port must be between 1 and 65535"));
+    }
+    Ok(port)
 }
 
 /// 解析 `MYAGENT_EXEC_TIMEOUT_SECS`：正整数秒 → `Ok`；0、非数字、溢出 → `Err`。
@@ -405,9 +477,9 @@ fn main() {
         Err(_) => RuntimeConfig::default(),
     };
 
-    // Runtime 选择：MYAGENT_RUNTIME=local（默认）/ nix（exec 落在 devShell）
-    let runtime = match build_runtime(config.clone()) {
-        Ok(runtime) => runtime,
+    // Runtime 选择：MYAGENT_RUNTIME=local（默认）/ nix（exec 落在 devShell）/ ssh（远程）
+    let (runtime, ssh_banner) = match build_runtime(config.clone()) {
+        Ok((runtime, banner)) => (runtime, banner),
         Err(msg) => {
             eprintln!("{}", ui_stderr.red(&msg));
             std::process::exit(1);
@@ -484,6 +556,18 @@ fn main() {
         );
     }
 
+    // 启动横幅：SSH Runtime 实际状态（主机 + 远程根，整条 dim）。
+    if let Some(banner) = &ssh_banner {
+        eprintln!(
+            "{}",
+            ui_stderr.dim(&format!("runtime: ssh ({})", banner.host))
+        );
+        eprintln!(
+            "{}",
+            ui_stderr.dim(&format!("remote root: {}", banner.remote_root.display()))
+        );
+    }
+
     // 启动时恢复已有 conversation（文件不存在则从空对话开始）
     let path = session_path();
     let mut conversation = match Session::load(&path) {
@@ -516,7 +600,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_path_from, parse_exec_timeout, show_reasoning_from};
+    use super::{
+        history_path_from, parse_exec_timeout, parse_ssh_port, show_reasoning_from, ssh_host_from,
+    };
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -586,5 +672,38 @@ mod tests {
             history_path_from(Some("   ".to_string())),
             PathBuf::from(".myagent_history")
         );
+    }
+
+    /// MYAGENT_SSH_HOST：缺失 / 空串 / 全空白 → Err；合法主机（可含 user@）→ Ok。
+    #[test]
+    fn ssh_host_required_and_validated() {
+        assert!(ssh_host_from(None).is_err());
+        assert!(ssh_host_from(Some(String::new())).is_err());
+        assert!(ssh_host_from(Some("   ".to_string())).is_err());
+        assert_eq!(
+            ssh_host_from(Some("192.168.64.11".to_string())).unwrap(),
+            "192.168.64.11"
+        );
+        assert_eq!(
+            ssh_host_from(Some("dok@192.168.64.11".to_string())).unwrap(),
+            "dok@192.168.64.11"
+        );
+        assert_eq!(
+            ssh_host_from(Some("  host.example  ".to_string())).unwrap(),
+            "host.example"
+        );
+    }
+
+    /// MYAGENT_SSH_PORT：1..=65535 → Ok；0 / 非数字 / 越界 → Err。
+    #[test]
+    fn ssh_port_validated() {
+        assert_eq!(parse_ssh_port("22"), Ok(22));
+        assert_eq!(parse_ssh_port(" 2222 "), Ok(2222));
+        assert_eq!(parse_ssh_port("65535"), Ok(65535));
+        assert!(parse_ssh_port("0").is_err());
+        assert!(parse_ssh_port("").is_err());
+        assert!(parse_ssh_port("abc").is_err());
+        assert!(parse_ssh_port("-1").is_err());
+        assert!(parse_ssh_port("65536").is_err());
     }
 }

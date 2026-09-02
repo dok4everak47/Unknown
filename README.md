@@ -15,8 +15,9 @@ Nix
 ```
 
 > `Capability-based execution`（只读模式，`MYAGENT_READ_ONLY`）、`Runtime` 抽象
-> （工具副作用原语）、`Nix Runtime` 与 `Sandbox`（`MYAGENT_SANDBOX`，Seatbelt）
-> 均已实现，见下方代码结构。
+> （工具副作用原语）、`Nix Runtime`、`Sandbox`（`MYAGENT_SANDBOX`，Seatbelt）与
+> `SSH Runtime`（`MYAGENT_RUNTIME=ssh`，全部副作用经 ssh 转发到远程）均已实现，
+> 见下方代码结构。
 
 ## 当前状态
 
@@ -37,6 +38,7 @@ Nix
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
 - [x] Nix Runtime（`NixRuntime`：exec 经 `nix develop --command` 落在可复现 devShell）
+- [x] SSH Runtime（`SshRuntime`：读/写文件、列目录、exec 全部经系统 `ssh` 转发到远程主机，零新依赖；`MYAGENT_RUNTIME=ssh` + `MYAGENT_SSH_HOST`/`MYAGENT_SSH_PORT`/`MYAGENT_SSH_ROOT`）
 - [x] Sandbox（`SandboxedRuntime` 装饰器：exec 经 `/usr/bin/sandbox-exec` 放进 macOS Seatbelt 沙箱，`MYAGENT_SANDBOX=1/true` 启用，`MYAGENT_SANDBOX_NETWORK=1/true` 放行网络；文件操作仍委托内层 runtime）
 - [x] Capability-based execution（`Capabilities` 权限门；`MYAGENT_READ_ONLY=1/true` 只读模式）
 - [x] Session persistence（conversation 保存/恢复，单 session）
@@ -80,6 +82,7 @@ Final Response
 | `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command`（exec 超时可配置，`MYAGENT_EXEC_TIMEOUT_SECS`） |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
+| `src/ssh_runtime.rs` | `SshRuntime`：`Runtime` 第三实现（读/写文件、列目录、exec 全部经系统 `ssh` 转发到远程主机；本机路径映射为远程路径，文件内容 base64 over the wire，stdout/stderr 分离；`MYAGENT_RUNTIME=ssh` + `MYAGENT_SSH_HOST`/`MYAGENT_SSH_PORT`/`MYAGENT_SSH_ROOT`） |
 | `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`MYAGENT_SANDBOX` / `MYAGENT_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试；工具进度行 🔧/🚫 经 `ui` 着色） |
 | `src/ui.rs` | 终端富文本 UI：`Ui` 结构体持有着色开关 + ANSI 样式方法（`dim`/`bold`/`green`/`cyan`/`red`/`yellow` 与组合），`color_enabled` 纯函数计算开关（`is_terminal` × `NO_COLOR` × `MYAGENT_NO_COLOR`），零依赖，可单测 |
@@ -94,11 +97,18 @@ Final Response
 Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
 ```
 
-`Runtime` 有两个实现，CLI 用 `MYAGENT_RUNTIME` 环境变量选择：
+`Runtime` 有三个实现，CLI 用 `MYAGENT_RUNTIME` 环境变量选择：
 
 - `local`（默认）— `LocalRuntime`，std 直连文件系统与进程；
 - `nix` — `NixRuntime`，文件操作委托本地（nix 不虚拟化文件系统），exec 经
-  `nix develop --command` 在 flake.nix 声明的可复现 devShell 中执行（构造时验证 nix 可用）。
+  `nix develop --command` 在 flake.nix 声明的可复现 devShell 中执行（构造时验证 nix 可用）；
+- `ssh` — `SshRuntime`，读/写文件、列目录、exec 全部经系统 `ssh`（`-T -o
+  BatchMode=yes -o ConnectTimeout=10`，零新依赖）转发到远程主机：myagent 仍在本机
+  运行、终端体验不变，只是“文件系统”与“进程”落在远程。启动时探测连通性/免密并
+  解析远程根（`MYAGENT_SSH_ROOT` 或远程 home）；`MYAGENT_SSH_HOST` 必填（可含
+  `user@`），`MYAGENT_SSH_PORT` 默认 22。本机绝对路径映射为远程路径，文件内容
+  base64 over the wire，exec 在远程根以 `cd '<root>' && exec <cmd>` 运行。
+  需已配置免密登录（`ssh-copy-id <user>@<host>`）。
 
 exec 单次超时默认 60 秒，可用 `MYAGENT_EXEC_TIMEOUT_SECS`（正整数秒）调整——
 沙箱内冷构建 / LTO 较慢时调大；未设置走默认，非法取值（0 / 非数字 / 溢出）会
@@ -116,7 +126,7 @@ deny 全部写与网络，再仅放行工作目录与 `TMPDIR` 两个 subpath �
 委托内层 runtime。`MYAGENT_SANDBOX_NETWORK=1/true` 显式放行沙箱内网络（默认关，
 不会随 `MYAGENT_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec`
 不可用则构造失败、清晰报错并退出，绝不静默降级为不隔离。与 `MYAGENT_RUNTIME`（local /
-nix）、`MYAGENT_READ_ONLY` 三方正交可组合，默认行为零变化。
+nix / ssh）、`MYAGENT_READ_ONLY` 三方正交可组合，默认行为零变化。
 
 > 已验证局限：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
 > `nix develop`）当前不可用——nix 需在 `$HOME/.cache/nix` 等目录写锁文件，
@@ -163,6 +173,7 @@ export OPENAI_API_KEY="..."
 ```bash
 cargo run                 # 默认：exec 直接在当前环境执行（MYAGENT_RUNTIME=local），全能力
 MYAGENT_RUNTIME=nix cargo run   # exec 经 `nix develop --command` 在 devShell 中执行
+MYAGENT_RUNTIME=ssh cargo run   # 全部副作用经 ssh 转发到远程（MYAGENT_SSH_HOST 必填，见 .env.example）
 MYAGENT_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行命令（与 MYAGENT_RUNTIME 正交）
 MYAGENT_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认禁网
 MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
@@ -286,6 +297,8 @@ Tool system（扩展更多 typed tools）
 Capability-based execution ✅（已实现：只读模式，MYAGENT_READ_ONLY）
     ↓
 Sandbox ✅（已实现：Seatbelt 真实隔离，MYAGENT_SANDBOX）
+    ↓
+SSH Runtime ✅（已实现：全部副作用经 ssh 转发到远程，MYAGENT_RUNTIME=ssh）
 ```
 
 尚未实现（未来方向）：

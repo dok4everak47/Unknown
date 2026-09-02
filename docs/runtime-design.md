@@ -369,9 +369,11 @@ impl Default for Capabilities {
 
 已落地：`Runtime` trait（§5 条件 2，见 §8）、`NixRuntime`（§8）、`Capabilities`
 权限门（§5 条件 3，见 §9）、`Sandbox`（Seatbelt 装饰器，见 §10）、`RuntimeConfig`
-（§5 条件 1，见 §11）。以下仍**未实现**，且当前**无需求**，不要提前引入：
+（§5 条件 1，见 §11）、`SshRuntime`（远程 backend，见 §12）。以下仍**未实现**，
+且当前**无需求**，不要提前引入：
 
-- **Container / remote executor** —— 无远程/隔离执行需求
+- **Container / remote executor（容器化）** —— 经 `ssh` 转发到远程已落地（§12，
+  覆盖“远程执行”需求）；容器 / Docker 类隔离仍无需求
 - **exec 白名单扩展** —— 有明确需求再议，需与 nix develop / sandbox 语义配合
 
 **判据**：上述任何一项，只有当 §5 的对应条件出现时才值得实现。
@@ -517,3 +519,60 @@ trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 
 工具层签名**——config 直接挂在 runtime 实现上，改动面收敛在 `runtime.rs` 与其
 调用点，工具层与 Agent 零架构变化（仅测试里 `&LocalRuntime` 机械更新为
 `&LocalRuntime::default()`）。
+
+## 12. SSH Runtime 已落地形态（2026-09-01）
+
+§5 条件 2（第二个执行 backend）再次触发：需求是把 myagent 的“文件系统与进程”
+放到远程主机——本机只做终端与 Agent 逻辑，工具的全部副作用（读/写文件、列目录、
+exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
+（`src/ssh_runtime.rs`）：
+
+- **零新依赖**：只调用系统 `ssh` 可执行文件（`std::process::Command`），不引入
+  ssh2 / openssh crate。`ssh -T -o BatchMode=yes -o ConnectTimeout=10
+  [-p PORT] [USER@]HOST -- <cmd>`：`-T` 不分配 pty（输出干净）；
+  `BatchMode=yes` 绝不交互式提示密码（没配免密就快速失败，不挂住等输入）；
+  `--` 分隔 host 与远程命令（OpenSSH 消费该分隔符）。argv 构造为纯函数
+  `ssh_argv`（无 ssh 环境下可单元测试）。
+- **路径映射**：`map_path`（纯函数）把本机绝对路径 `strip_prefix(local_root)`
+  后 `join` 到 `remote_root`；不在本机 root 之下 → 拒绝。`local_root` 构造时
+  canonicalize（macOS `/var` → `/private/var`）；`remote_root` 启动时经 ssh 解析
+  （`MYAGENT_SSH_ROOT` 指定则 `cd '<root>' && pwd -P` 校验规范化，未指定则
+  `pwd` 取远程 home）。工具层保证路径在本机 root 之内，映射失败正常不会发生。
+- **文件内容 base64 over the wire**：`read_file` 远程 `base64 -- <file>`（内容
+  走 stdout，stderr 分离不污染）；`write_file` 本地 base64 后 `printf '%s' '…'
+  | base64 -d > <file>`（base64 字符集仅 `[A-Za-z0-9+/=]`，无 shell 元字符，
+  可安全放进远程命令）。自实现 base64 编解码（`b64_encode` / `b64_decode` 纯函数，
+  零依赖），解码容忍 GNU base64 的 76 列换行。
+- **stdout/stderr 分离捕获**：模块内私有 `capture_remote`（与 `run_command` 同样
+  的超时轮询模式）**分离**捕获 stdout/stderr——文件内容不能被 stderr 污染；
+  exec 需要合并输出时由 `merge_output` 合并（对齐 `LocalRuntime` exec 语义）。
+  不修改 `runtime.rs` 共享 `run_command` 的签名。
+- **read_dir**：远程 POSIX sh `for f in * .[!.]* ..?*` 输出 tab 分隔的
+  `<type>\t<name>`（含隐藏文件；D/L/F/O），`parse_dir_listing`（纯函数）解析。
+- **exec**：`cd '<remote_root>' && exec <program> <args...>`，cwd 固定为远程根
+  （忽略入参）；program/args 已被工具白名单校验为安全字符集（无 shell 元字符），
+  无需引用；ssh 透传远程退出码。
+- **构造探测**：`SshRuntime::new` 先 `ssh ... -- true` 探测连通性 + 免密（任何
+  失败 → 清晰 `io::Error`，提示检查 `MYAGENT_SSH_HOST` / `ssh-copy-id` /
+  网络防火墙），再解析远程根。`from_parts` 可注入自定义 ssh 二进制与 root 供测试
+  （对齐 `sandbox.rs` 的 `from_parts` / `for_test` 模式）。
+- **CLI**：`MYAGENT_RUNTIME=ssh` 启用；`MYAGENT_SSH_HOST` 必填（可含 `user@`），
+  `MYAGENT_SSH_PORT` 默认 22（1..=65535，非法清晰报错），`MYAGENT_SSH_ROOT`
+  默认远程 home。解析为纯函数 `ssh_host_from` / `parse_ssh_port`（`src/main.rs`，
+  单测覆盖）。启动时 stderr 打印 `runtime: ssh (<host>)` 与
+  `remote root: <path>` 便于确认。
+- **测试**：纯函数单测（`ssh_argv` / `sh_quote` / `map_path` / `parse_dir_listing` /
+  base64 往返 / `ssh_host_from` / `parse_ssh_port`）+ 一个 gated 集成测试
+  `gated_fake_ssh_roundtrip`（`SSH_RUNTIME_TESTS=1` 时运行）：用临时目录里的假
+  `ssh` 脚本模拟远程（backing dir 映射 root，支持 `true` / `pwd` / `mkdir` /
+  base64 编解码 / `ls` / `exec`），端到端覆盖 write（含父目录自动创建）→
+  大文件 base64 往返 → read → read_dir → exec 成功/失败 → NotFound 映射 →
+  路径越界拒绝。
+
+**与 §6 草案的差异**：草案方案 B 的 `Executor` 假设 backend 只有“命令执行”；
+实际 `Runtime` trait 的四个原语（含文件读写/列目录）都被 SshRuntime 实现了——
+远程 backend 的文件语义（路径映射 + base64 传输）落在 SshRuntime 内部，
+`tool.rs` / `agent.rs` 零改动，与 `SandboxedRuntime` 装饰器、`Capabilities`
+正交可组合。`MYAGENT_RUNTIME=nix + ssh` 互斥（单值选择）；`MYAGENT_RUNTIME=ssh`
++ `MYAGENT_SANDBOX=1` 的组合会把 `ssh` 命令本身放进 Seatbelt 沙箱（未验证、
+无默认需求，文档注明）。
