@@ -72,6 +72,20 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "list_dir",
+            description: "List the entries of a directory inside the project (non-recursive, one level only). Returns each entry name with its kind (file/directory/symlink), including hidden dotfiles. Use this to discover what files exist before reading or searching; call it again on a subdirectory to go deeper.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to the project root. Omit or leave empty to list the project root."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
             name: "edit_file",
             description: "Replace an exact piece of text in a file. The path must be inside the project directory.",
             parameters: serde_json::json!({
@@ -172,6 +186,7 @@ pub enum Tool {
     WriteFile(WriteFile),
     EditFile(EditFile),
     Search(Search),
+    ListDir(ListDir),
     Exec(Exec),
 }
 
@@ -189,6 +204,11 @@ pub struct WriteFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Search {
     pub query: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDir {
     pub path: Option<String>,
 }
 
@@ -308,6 +328,17 @@ impl Tool {
                     path,
                 }))
             }
+            "list_dir" => {
+                // path 缺失 / null / 非字符串 / 空串 / 全空白 → None（列项目根）；
+                // 否则 trim 后作为子目录路径。
+                let path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string());
+                Ok(Tool::ListDir(ListDir { path }))
+            }
             other => Err(ToolError::UnknownTool(other.to_string())),
         }
     }
@@ -323,6 +354,7 @@ impl Tool {
                 write_file_within(rt, root, &write_file.path, &write_file.content)
             }
             Tool::Search(search) => search_within(rt, root, &search.query, search.path.as_deref()),
+            Tool::ListDir(list_dir) => list_dir_within(rt, root, list_dir.path.as_deref()),
             Tool::EditFile(edit_file) => {
                 edit_file_within(rt, root, &edit_file.path, &edit_file.old, &edit_file.new)
             }
@@ -338,6 +370,45 @@ fn read_file_within(rt: &dyn Runtime, root: &Path, path: &str) -> Result<String,
     let resolved = resolve_within(root, path, false)?;
     rt.read_file(&resolved)
         .map_err(ToolError::Io)
+}
+
+/// 列目录条目（非递归，一层），但限制路径必须位于 `root` 之内。
+///
+/// 与 `read_file_within` 共用同一套路径边界校验；`path` 为 None / 空时列项目根。
+///
+/// 输出格式（逐行、稳定）：目录 → `<name>/ (directory)`；普通文件 →
+/// `<name> (file)`；符号链接 → `<name> (symlink)`；`EntryKind::Other` 跳过
+/// （与 search 遍历的忽略语义一致）。条目名取 `RuntimeEntry.path` 的
+/// `file_name()`（该字段是完整路径）。含隐藏文件（dotfile），不过滤；
+/// 按条目名排序保证输出确定性（`fs::read_dir` 与远程脚本的返回顺序都不稳定）。
+fn list_dir_within(rt: &dyn Runtime, root: &Path, path: Option<&str>) -> Result<String, ToolError> {
+    let resolved = resolve_within(root, path.unwrap_or("."), false)?;
+    let mut entries = rt
+        .read_dir(&resolved)
+        .map_err(ToolError::Io)?;
+
+    entries.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
+
+    let mut lines: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        match entry.kind {
+            EntryKind::Dir => lines.push(format!("{name}/ (directory)")),
+            EntryKind::File => lines.push(format!("{name} (file)")),
+            EntryKind::Symlink => lines.push(format!("{name} (symlink)")),
+            // EntryKind::Other：遍历方忽略
+            EntryKind::Other => {}
+        }
+    }
+
+    if lines.is_empty() {
+        Ok("Directory is empty.".to_string())
+    } else {
+        Ok(lines.join("\n"))
+    }
 }
 
 /// 写入文件，但限制路径必须位于 `root` 之内。
@@ -1419,6 +1490,201 @@ mod tests {
         assert_eq!(edited, "function foo() { return bar; }");
     }
 
+    // ---------------- list_dir ----------------
+
+    #[test]
+    fn from_call_list_dir_defaults_to_none() {
+        // 无 path 字段
+        let tool = Tool::from_call("list_dir", &serde_json::json!({})).unwrap();
+        assert_eq!(tool, Tool::ListDir(ListDir { path: None }));
+        // path 为 null
+        let tool = Tool::from_call("list_dir", &serde_json::json!({ "path": null })).unwrap();
+        assert_eq!(tool, Tool::ListDir(ListDir { path: None }));
+        // 空串
+        let tool = Tool::from_call("list_dir", &serde_json::json!({ "path": "" })).unwrap();
+        assert_eq!(tool, Tool::ListDir(ListDir { path: None }));
+        // 全空白
+        let tool = Tool::from_call("list_dir", &serde_json::json!({ "path": "   " })).unwrap();
+        assert_eq!(tool, Tool::ListDir(ListDir { path: None }));
+    }
+
+    #[test]
+    fn from_call_list_dir_parses_path() {
+        let args = serde_json::json!({ "path": "src" });
+        let tool = Tool::from_call("list_dir", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::ListDir(ListDir {
+                path: Some("src".to_string()),
+            })
+        );
+        // 显式 path 会 trim 空白
+        let args = serde_json::json!({ "path": "  src  " });
+        let tool = Tool::from_call("list_dir", &args).unwrap();
+        assert_eq!(
+            tool,
+            Tool::ListDir(ListDir {
+                path: Some("src".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn list_dir_lists_project_root() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join(".hidden"), "dotfile").unwrap();
+
+        let tool = Tool::ListDir(ListDir { path: None });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert!(result.contains("main.rs (file)"), "unexpected: {result}");
+        assert!(result.contains("src/ (directory)"), "unexpected: {result}");
+        // 含隐藏文件（dotfile）
+        assert!(result.contains(".hidden (file)"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn list_dir_is_non_recursive() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let tool = Tool::ListDir(ListDir { path: None });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert!(result.contains("main.rs (file)"), "unexpected: {result}");
+        assert!(result.contains("src/ (directory)"), "unexpected: {result}");
+        // 非递归：子目录内的文件不出现
+        assert!(!result.contains("lib.rs"), "unexpected: {result}");
+    }
+
+    #[test]
+    fn list_dir_lists_subdirectory() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let tool = Tool::ListDir(ListDir {
+            path: Some("src".to_string()),
+        });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert!(result.contains("lib.rs (file)"), "unexpected: {result}");
+        assert!(!result.contains("main.rs"), "unexpected: {result}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_marks_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        fs::write(root.join("target.txt"), "x").unwrap();
+        symlink("target.txt", root.join("link.txt")).unwrap();
+
+        let tool = Tool::ListDir(ListDir { path: None });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert!(result.contains("target.txt (file)"), "unexpected: {result}");
+        assert!(
+            result.contains("link.txt (symlink)"),
+            "unexpected: {result}"
+        );
+    }
+
+    #[test]
+    fn list_dir_rejects_parent_traversal() {
+        let root = temp_root();
+        let tool = Tool::ListDir(ListDir {
+            path: Some("../outside".to_string()),
+        });
+        assert!(matches!(
+            tool.execute(&LocalRuntime::default(), &root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn list_dir_rejects_absolute_path() {
+        let root = temp_root();
+        let tool = Tool::ListDir(ListDir {
+            path: Some("/etc".to_string()),
+        });
+        assert!(matches!(
+            tool.execute(&LocalRuntime::default(), &root),
+            Err(ToolError::OutsideProject(_))
+        ));
+    }
+
+    #[test]
+    fn list_dir_rejects_nonexistent_directory() {
+        let root = temp_root();
+        let tool = Tool::ListDir(ListDir {
+            path: Some("missing".to_string()),
+        });
+        assert!(matches!(
+            tool.execute(&LocalRuntime::default(), &root),
+            Err(ToolError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn list_dir_reports_empty_directory() {
+        let root = temp_root();
+        let tool = Tool::ListDir(ListDir { path: None });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert_eq!(result, "Directory is empty.");
+    }
+
+    #[test]
+    fn list_dir_output_is_sorted_and_deterministic() {
+        let root = temp_root();
+        fs::write(root.join("zeta.txt"), "x").unwrap();
+        fs::write(root.join("alpha.rs"), "x").unwrap();
+        fs::create_dir(root.join("mid")).unwrap();
+        fs::write(root.join(".dot"), "x").unwrap();
+
+        let tool = Tool::ListDir(ListDir { path: None });
+        let first = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        let second = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        // 两次调用结果一致（确定性）
+        assert_eq!(first, second);
+        // 按条目名排序（'.' < 'a' < 'm' < 'z'），目录/文件混合，逐行稳定
+        assert_eq!(
+            first,
+            ".dot (file)\nalpha.rs (file)\nmid/ (directory)\nzeta.txt (file)"
+        );
+    }
+
+    #[test]
+    fn all_definitions_includes_list_dir() {
+        let defs = all_definitions();
+        let list = defs
+            .iter()
+            .find(|d| d.name == "list_dir")
+            .unwrap();
+
+        assert_eq!(list.name, "list_dir");
+        assert!(list.description.contains("non-recursive"));
+        assert_eq!(list.parameters["type"], "object");
+        assert_eq!(list.parameters["properties"]["path"]["type"], "string");
+        assert_eq!(list.parameters["required"], serde_json::json!([]));
+    }
+
     #[test]
     fn all_definitions_includes_edit_file() {
         let defs = all_definitions();
@@ -1449,6 +1715,7 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"search"));
+        assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"edit_file"));
     }
 
@@ -1660,6 +1927,7 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"search"));
+        assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"exec"));
     }

@@ -8,7 +8,7 @@
 /// 不允许时直接把拒绝作为 Tool Result 回传给 Model，**不触碰 Runtime**。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
-    /// 允许读文件（`read_file` / `search`）。
+    /// 允许读文件（`read_file` / `search` / `list_dir`）。
     pub filesystem_read: bool,
     /// 允许写文件（`write_file` / `edit_file`）。
     pub filesystem_write: bool,
@@ -77,10 +77,12 @@ enum Capability {
 
 /// 工具名 → 所需能力（纯函数）。
 ///
-/// 覆盖现有 5 个工具；未知工具名返回 `None`（不拦截）。
+/// 覆盖现有 6 个工具；未知工具名返回 `None`（不拦截）。
 fn required_capability(tool_name: &str) -> Option<(Capability, &'static str)> {
     match tool_name {
-        "read_file" | "search" => Some((Capability::FilesystemRead, "filesystem_read")),
+        "read_file" | "search" | "list_dir" => {
+            Some((Capability::FilesystemRead, "filesystem_read"))
+        }
         "write_file" | "edit_file" => Some((Capability::FilesystemWrite, "filesystem_write")),
         "exec" => Some((Capability::ProcessExecute, "process_execute")),
         _ => None,
@@ -91,7 +93,7 @@ fn required_capability(tool_name: &str) -> Option<(Capability, &'static str)> {
 mod tests {
     use super::*;
 
-    /// 工具名 → 所需能力映射的纯函数单元测试（5 个工具 + 未知名）。
+    /// 工具名 → 所需能力映射的纯函数单元测试（6 个工具 + 未知名）。
     #[test]
     fn maps_tool_names_to_capabilities() {
         use Capability::*;
@@ -101,6 +103,10 @@ mod tests {
         );
         assert_eq!(
             required_capability("search"),
+            Some((FilesystemRead, "filesystem_read"))
+        );
+        assert_eq!(
+            required_capability("list_dir"),
             Some((FilesystemRead, "filesystem_read"))
         );
         assert_eq!(
@@ -124,7 +130,14 @@ mod tests {
     #[test]
     fn default_allows_everything() {
         let caps = Capabilities::default();
-        for tool in ["read_file", "search", "write_file", "edit_file", "exec"] {
+        for tool in [
+            "read_file",
+            "search",
+            "list_dir",
+            "write_file",
+            "edit_file",
+            "exec",
+        ] {
             assert!(caps.allows(tool), "{tool} should be allowed by default");
         }
     }
@@ -135,6 +148,8 @@ mod tests {
         let caps = Capabilities::read_only();
         assert!(caps.allows("read_file"));
         assert!(caps.allows("search"));
+        // list_dir 是只读工具（FilesystemRead），与 read_file/search 同被放行
+        assert!(caps.allows("list_dir"));
         assert!(!caps.allows("write_file"));
         assert!(!caps.allows("edit_file"));
         assert!(!caps.allows("exec"));
@@ -158,6 +173,7 @@ mod tests {
             process_execute: true,
         };
         assert!(no_write.allows("read_file"));
+        assert!(no_write.allows("list_dir"));
         assert!(!no_write.allows("write_file"));
         assert!(!no_write.allows("edit_file"));
         assert!(no_write.allows("exec"));
@@ -169,6 +185,7 @@ mod tests {
         };
         assert!(!no_read.allows("read_file"));
         assert!(!no_read.allows("search"));
+        assert!(!no_read.allows("list_dir"));
         assert!(no_read.allows("write_file"));
     }
 }

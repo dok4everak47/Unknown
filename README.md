@@ -34,6 +34,7 @@ Nix
 - [x] `read_file` 工具
 - [x] `write_file` 工具
 - [x] `search` 工具
+- [x] `list_dir` 工具（列目录，非递归一层，含 dotfile，按名排序）
 - [x] `edit_file` 工具（精确文本替换）
 - [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
@@ -78,7 +79,7 @@ Final Response
 | --- | --- |
 | `src/message.rs` | conversation message 类型（`Role`、`Message`、`ToolCall`） |
 | `src/model.rs` | `Model` trait + OpenAI-compatible provider + SSE 流式（`complete_streaming`）+ API 层序列化 |
-| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
+| `src/tool.rs` | `Tool` 抽象 + `read_file` + `write_file` + `search` + `list_dir` + `edit_file` + `exec` + 路径边界校验（纯逻辑，副作用经 `Runtime`） |
 | `src/capabilities.rs` | `Capabilities` 权限门：`filesystem_read` / `filesystem_write` / `process_execute`，工具名→能力映射与 `allows` 判定 |
 | `src/runtime.rs` | `Runtime` trait（读/写文件、列目录、执行命令的副作用原语）+ `LocalRuntime`（std 实现）+ 共享 `run_command`（exec 超时可配置，`MYAGENT_EXEC_TIMEOUT_SECS`） |
 | `src/nix_runtime.rs` | `NixRuntime`：`Runtime` 第二实现（文件操作委托 `LocalRuntime`，exec 经 `nix develop --command` 在 devShell 中执行） |
@@ -264,7 +265,7 @@ cargo clippy
 > 脱离 nix devShell 的普通 `cargo build --release` 可以正常构建，只是不做体积优化
 > （二进制更大）。
 
-测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `edit_file` / `exec` 的工具执行，Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限），session 的 save→load round-trip（含空/多轮/带 ToolCall 的 conversation）与损坏文件错误处理，以及 `OpenAICompatibleModel` ↔ Agent 的 mock-HTTP 集成测试（验证真实 provider 的请求序列化、ToolCall → 工具执行 → Tool Result 回传、API 错误传播，不依赖外部 LLM）。
+测试覆盖消息序列化、API 响应解析、工具参数解析、路径边界校验（含 `..` 跳转、绝对路径、symlink 逃逸），`read_file` / `write_file` / `search` / `list_dir` / `edit_file` / `exec` 的工具执行，Agent Loop 的协调逻辑（用 fake Model 注入，验证文本响应、单次/多次/批量 Tool Call、Tool 错误回传、Model 错误传播、`MAX_TOOL_ROUNDS` 上限），session 的 save→load round-trip（含空/多轮/带 ToolCall 的 conversation）与损坏文件错误处理，以及 `OpenAICompatibleModel` ↔ Agent 的 mock-HTTP 集成测试（验证真实 provider 的请求序列化、ToolCall → 工具执行 → Tool Result 回传、API 错误传播，不依赖外部 LLM）。
 
 Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-collaboration.md)：默认一个 Agent 负责实现，另一个 Agent 只读审查，用户负责授权与合并。
 
