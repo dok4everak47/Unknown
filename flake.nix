@@ -45,9 +45,9 @@
         # Apple ld64 不搜索 nix store 路径；build.rs 据此输出
         # `rustc-link-arg=-L<dir>`（对所有链接 target 生效）。引用 pkgs.libiconv
         # 使其进入 devShell 闭包，`nix store gc` 不会回收。
-        MYAGENT_LIBICONV_LIB_DIR = "${pkgs.libiconv}/lib";
+        KARAKURI_LIBICONV_LIB_DIR = "${pkgs.libiconv}/lib";
         # aws-lc-sys 等依赖的 build script 二进制也用 Apple ld64 链接且带 -liconv，
-        # myagent 自己的 build.rs 无法影响它们的链接，因此用 target 级 RUSTFLAGS
+        # karakuri 自己的 build.rs 无法影响它们的链接，因此用 target 级 RUSTFLAGS
         # 环境变量把 libiconv 搜索路径注入所有 rustc 链接。此 env 与
         # .cargo/config.toml 的 [target.aarch64-apple-darwin] rustflags（机器
         # outliner）是**合并**关系，不会互相覆盖（已验证）；store 路径由 flake

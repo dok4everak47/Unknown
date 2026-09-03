@@ -303,7 +303,7 @@ mod tests {
     fn temp_root() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("myagent-agent-test-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("karakuri-agent-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -1,6 +1,6 @@
 # Sandbox 设计文档
 
-> 状态：**已实现**（2026-09-01，`src/sandbox.rs`，`MYAGENT_SANDBOX=1/true` 启用）
+> 状态：**已实现**（2026-09-01，`src/sandbox.rs`，`KARAKURI_SANDBOX=1/true` 启用）
 > 关联：AGENTS.md（roadmap Sandbox）、[runtime-design.md](runtime-design.md)（§10 已落地形态）
 > 本文记录威胁模型、方案设计与验收清单；实现细节见 `src/sandbox.rs` 与 §9。
 
@@ -85,7 +85,7 @@ exec argv 变换（纯函数，可单测）：
 ```scheme
 (version 1)
 (allow default)
-;; 网络：默认全禁（MYAGENT_SANDBOX_NETWORK=1 时去掉本行）
+;; 网络：默认全禁（KARAKURI_SANDBOX_NETWORK=1 时去掉本行）
 (deny network*)
 ;; 写入：默认全禁，仅放开项目根与临时目录
 (deny file-write*)
@@ -127,17 +127,17 @@ exec argv 变换（纯函数，可单测）：
 
 | 变量 | 取值 | 效果 |
 | --- | --- | --- |
-| `MYAGENT_SANDBOX` | `1` / `true` | exec 经 sandbox-exec 运行（默认关） |
-| `MYAGENT_SANDBOX_NETWORK` | `1` / `true` | 沙箱内**放开网络**（默认关） |
+| `KARAKURI_SANDBOX` | `1` / `true` | exec 经 sandbox-exec 运行（默认关） |
+| `KARAKURI_SANDBOX_NETWORK` | `1` / `true` | 沙箱内**放开网络**（默认关） |
 
 ### 5.1 网络边界（反馈③）
 
-- **网络默认关闭，放开是用户侧显式 opt-in**，不随 `MYAGENT_SANDBOX=1`
+- **网络默认关闭，放开是用户侧显式 opt-in**，不随 `KARAKURI_SANDBOX=1`
   隐式开启；
 - 启动横幅必须显示实际状态，例如 `sandbox: on (network: off)` /
   `sandbox: on (network: ON — cargo commands can access the network)`；
 - 使用场景：首次构建需下载 crates.io 依赖时临时开
-  `MYAGENT_SANDBOX_NETWORK=1`，拉完依赖关掉；warm cache 下保持关闭。
+  `KARAKURI_SANDBOX_NETWORK=1`，拉完依赖关掉；warm cache 下保持关闭。
 
 ### 5.2 环境变量边界（反馈③）
 
@@ -154,11 +154,11 @@ exec argv 变换（纯函数，可单测）：
 # 推荐（已端到端验证）：在 nix develop shell 内启动 agent + 沙箱——
 # 工具链是 nix 的，cargo / build.rs 同被 Seatbelt 禁锢
 nix develop
-MYAGENT_SANDBOX=1 cargo run
-MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉依赖
+KARAKURI_SANDBOX=1 cargo run
+KARAKURI_SANDBOX=1 KARAKURI_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉依赖
 ```
 
-> **已验证局限（2026-09-01）**：`MYAGENT_RUNTIME=nix` 与 `MYAGENT_SANDBOX=1`
+> **已验证局限（2026-09-01）**：`KARAKURI_RUNTIME=nix` 与 `KARAKURI_SANDBOX=1`
 > 的组合（sandbox-exec 包 `nix develop`）当前**不可用**：nix 评估 flake 时需在
 > `$HOME/.cache/nix/fetcher-locks/` 建锁文件（随后建 profile 还需写
 > `$HOME/.local/state/nix/profiles/`），均在 ROOT/TMPDIR 之外被策略拒绝
@@ -215,7 +215,7 @@ MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉�
 - [x] 恶意 build.rs 的越界写、外联全部失败，攻击产物不存在
   （`malicious_build_rs_is_confined_and_harmless_control_succeeds`）；
 - [x] 无害 build.rs 对照组在沙箱内 `cargo build` 成功（同一测试）；
-- [x] 默认策略衍生进程无法联网；`MYAGENT_SANDBOX_NETWORK=1` opt-in 后可以
+- [x] 默认策略衍生进程无法联网；`KARAKURI_SANDBOX_NETWORK=1` opt-in 后可以
   （`network_denied_by_default_and_opt_in_connects`）；
 - [x] 横幅正确显示 sandbox 与 network 状态（`sandbox: on (network: off/ON)`，
   真实 CLI 冒烟验证）；
@@ -232,7 +232,7 @@ MYAGENT_SANDBOX=1 MYAGENT_SANDBOX_NETWORK=1 cargo run  # 临时放开网络拉�
 src/sandbox.rs        SandboxedRuntime { inner: Box<dyn Runtime> }
                       exec: sandbox_argv(program, args, root, network) → run_command(...)
                       文件操作：self.inner.read_file/write_file/read_dir
-src/main.rs           MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 解析，
+src/main.rs           KARAKURI_SANDBOX / KARAKURI_SANDBOX_NETWORK 解析，
                       按标志包装 runtime（在 runtime 选择之后）
 ```
 

@@ -24,7 +24,7 @@
 # block and the `linker =` below (see git history). Since the config migration it
 # comes from the nix devShell environment variables (CC/CXX/CFLAGS and
 # CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER, see flake.nix); build.rs translates
-# MYAGENT_LIBICONV_LIB_DIR into a rustc link arg for ld64.
+# KARAKURI_LIBICONV_LIB_DIR into a rustc link arg for ld64.
 [target.aarch64-apple-darwin]
 rustflags = [
     "-C", "llvm-args=-enable-machine-outliner=always",

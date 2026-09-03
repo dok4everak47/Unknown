@@ -1,7 +1,7 @@
 //! 终端输出富文本化（ANSI 颜色层次），零新依赖。
 //!
 //! 只使用 ANSI 转义序列 + std。所有样式方法在 `enabled=false` 时原样返回
-//! 输入文本（不含任何转义码），保证非 tty / `NO_COLOR` / `MYAGENT_NO_COLOR`
+//! 输入文本（不含任何转义码），保证非 tty / `NO_COLOR` / `KARAKURI_NO_COLOR`
 //! 下输出与纯文本完全一致（逐字保持现状）。
 //!
 //! 着色开关在 main.rs 启动时各计算一次（stdout / stderr 各自的 `is_terminal()`），
@@ -150,14 +150,14 @@ impl Ui {
 /// - `io_is_terminal`：stdout / stderr 各自的 `is_terminal()`；
 /// - `no_color_env`：`NO_COLOR` 环境变量值（未设置 → `None`）。按
 ///   https://no-color.org，只要**设置了**（任何值，含空串）即禁用颜色；
-/// - `myagent_no_color`：`MYAGENT_NO_COLOR` 环境变量值（未设置 → `None`）。
+/// - `karakuri_no_color`：`KARAKURI_NO_COLOR` 环境变量值（未设置 → `None`）。
 ///   取值为 `1` / `true`（大小写不敏感）时禁用颜色。
 ///
-/// 规则：`io_is_terminal && NO_COLOR 未设置 && MYAGENT_NO_COLOR 不是 1/true`。
+/// 规则：`io_is_terminal && NO_COLOR 未设置 && KARAKURI_NO_COLOR 不是 1/true`。
 pub fn color_enabled(
     io_is_terminal: bool,
     no_color_env: Option<&str>,
-    myagent_no_color: Option<&str>,
+    karakuri_no_color: Option<&str>,
 ) -> bool {
     if !io_is_terminal {
         return false;
@@ -165,7 +165,7 @@ pub fn color_enabled(
     if no_color_env.is_some() {
         return false;
     }
-    match myagent_no_color {
+    match karakuri_no_color {
         Some(value) => !matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
         None => true,
     }
@@ -286,7 +286,7 @@ mod tests {
         );
     }
 
-    /// color_enabled 真值表：tty/非tty × NO_COLOR 设/未设 × MYAGENT_NO_COLOR 各值。
+    /// color_enabled 真值表：tty/非tty × NO_COLOR 设/未设 × KARAKURI_NO_COLOR 各值。
     #[test]
     fn color_enabled_truth_table() {
         // 非 tty → 恒 false（无论 env）。
@@ -299,7 +299,7 @@ mod tests {
         // tty、无任何禁色变量 → true。
         assert!(color_enabled(true, None, None));
 
-        // tty + MYAGENT_NO_COLOR 不是 1/true（0 / false / 空串 / 未设）→ true。
+        // tty + KARAKURI_NO_COLOR 不是 1/true（0 / false / 空串 / 未设）→ true。
         assert!(color_enabled(true, None, Some("0")));
         assert!(color_enabled(true, None, Some("false")));
         assert!(color_enabled(true, None, Some("")));
@@ -311,11 +311,11 @@ mod tests {
         assert!(!color_enabled(true, Some("0"), None));
         assert!(!color_enabled(true, Some("anything"), None));
 
-        // NO_COLOR 优先：即使 MYAGENT_NO_COLOR 非 1/true，NO_COLOR 设了仍关闭。
+        // NO_COLOR 优先：即使 KARAKURI_NO_COLOR 非 1/true，NO_COLOR 设了仍关闭。
         assert!(!color_enabled(true, Some(""), Some("0")));
         assert!(!color_enabled(true, Some(""), Some("false")));
 
-        // tty + MYAGENT_NO_COLOR=1 / true（大小写不敏感，可带空白）→ false。
+        // tty + KARAKURI_NO_COLOR=1 / true（大小写不敏感，可带空白）→ false。
         assert!(!color_enabled(true, None, Some("1")));
         assert!(!color_enabled(true, None, Some("true")));
         assert!(!color_enabled(true, None, Some("TRUE")));

@@ -712,7 +712,7 @@ mod tests {
     fn temp_root() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("myagent-tool-test-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("karakuri-tool-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -782,7 +782,7 @@ mod tests {
         let outside = root
             .parent()
             .unwrap()
-            .join(format!("myagent-outside-{}", std::process::id()));
+            .join(format!("karakuri-outside-{}", std::process::id()));
         fs::write(&outside, "outside").unwrap();
         symlink(&outside, root.join("link.txt")).unwrap();
 
@@ -943,7 +943,7 @@ mod tests {
         let outside = root
             .parent()
             .unwrap()
-            .join(format!("myagent-write-outside-{}", std::process::id()));
+            .join(format!("karakuri-write-outside-{}", std::process::id()));
         fs::write(&outside, "outside").unwrap();
         symlink(&outside, root.join("link.txt")).unwrap();
 
@@ -1126,7 +1126,7 @@ mod tests {
         let outside = root
             .parent()
             .unwrap()
-            .join(format!("myagent-search-outside-{}", std::process::id()));
+            .join(format!("karakuri-search-outside-{}", std::process::id()));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("secret.rs"), "needle\n").unwrap();
         symlink(&outside, root.join("link")).unwrap();
@@ -1148,7 +1148,7 @@ mod tests {
 
         let root = temp_root();
         let outside = root.parent().unwrap().join(format!(
-            "myagent-search-walk-outside-{}",
+            "karakuri-search-walk-outside-{}",
             std::process::id()
         ));
         fs::create_dir_all(&outside).unwrap();
@@ -1405,7 +1405,7 @@ mod tests {
         let outside = root
             .parent()
             .unwrap()
-            .join(format!("myagent-edit-outside-{}", std::process::id()));
+            .join(format!("karakuri-edit-outside-{}", std::process::id()));
         fs::write(&outside, "outside\n").unwrap();
         symlink(&outside, root.join("link.txt")).unwrap();
 
@@ -1944,11 +1944,11 @@ mod exec_tests {
     fn temp_cargo_root() -> PathBuf {
         let n = EXEC_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("myagent-exec-test-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("karakuri-exec-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("Cargo.toml"),
-            "[package]\nname = \"myagent-exec-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n",
+            "[package]\nname = \"karakuri-exec-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n",
         )
         .unwrap();
         fs::create_dir_all(dir.join("src")).unwrap();
@@ -2034,7 +2034,7 @@ mod exec_tests {
             .execute(&LocalRuntime::default(), &root)
             .unwrap();
         assert!(
-            result.contains("myagent-exec-fixture"),
+            result.contains("karakuri-exec-fixture"),
             "unexpected: {result}"
         );
     }

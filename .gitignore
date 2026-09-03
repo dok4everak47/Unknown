@@ -19,4 +19,4 @@ target/
 # session persistence artifact
 session.json
 # REPL command history (rustyline, tty mode only)
-.myagent_history
+.karakuri_history

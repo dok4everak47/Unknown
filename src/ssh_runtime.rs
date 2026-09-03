@@ -1,7 +1,7 @@
 //! SSH Runtime：`Runtime` trait 的第三实现，把全部副作用（读/写文件、列目录、
 //! exec）经系统 `ssh` 转发到远程主机执行。
 //!
-//! myagent 仍在本机运行、终端体验不变，只是"文件系统"与"进程"落在远程：
+//! karakuri 仍在本机运行、终端体验不变，只是"文件系统"与"进程"落在远程：
 //! 工具层传入的**本机绝对路径**（已 canonicalize、在本机 root 之下）经
 //! [`map_path`] 映射为远程路径后，交给远程 shell 处理。
 //!
@@ -28,7 +28,7 @@
 //!   `runtime::run_command` 同样超时轮询模式的私有 captured-run 辅助，不改动
 //!   共享 `run_command` 的签名。
 //!
-//! 配置经 `MYAGENT_RUNTIME=ssh` 启用（`main.rs` 解析 env 并接线，见
+//! 配置经 `KARAKURI_RUNTIME=ssh` 启用（`main.rs` 解析 env 并接线，见
 //! [`crate::main`]）；本模块只做纯函数解析与执行。
 //!
 //! 远程非交互 shell 的 PATH 注意：cargo 需要出现在远程默认 PATH 上（rustup
@@ -95,14 +95,14 @@ impl SshRuntime {
             Ok(out) if out.code == 0 => {}
             Ok(out) => {
                 return Err(io::Error::other(format!(
-                    "ssh to {host} failed (exit {}): {}\n  check MYAGENT_SSH_HOST, passwordless login (ssh-copy-id), network/firewall",
+                    "ssh to {host} failed (exit {}): {}\n  check KARAKURI_SSH_HOST, passwordless login (ssh-copy-id), network/firewall",
                     out.code,
                     out.stderr.trim()
                 )));
             }
             Err(ExecError::Io(err)) => {
                 return Err(io::Error::other(format!(
-                    "failed to run ssh to {host}: {err}\n  check MYAGENT_SSH_HOST, passwordless login (ssh-copy-id), network/firewall"
+                    "failed to run ssh to {host}: {err}\n  check KARAKURI_SSH_HOST, passwordless login (ssh-copy-id), network/firewall"
                 )));
             }
             Err(ExecError::TimedOut(_)) => {
@@ -125,7 +125,7 @@ impl SshRuntime {
                     Ok(out) if out.code == 0 => PathBuf::from(out.stdout.trim()),
                     Ok(out) => {
                         return Err(io::Error::other(format!(
-                            "remote root {:?} is not accessible (exit {}): {}\n  check MYAGENT_SSH_ROOT is an absolute path that exists on the remote host",
+                            "remote root {:?} is not accessible (exit {}): {}\n  check KARAKURI_SSH_ROOT is an absolute path that exists on the remote host",
                             root,
                             out.code,
                             out.stderr.trim()
@@ -613,7 +613,7 @@ mod tests {
     fn temp_root() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("myagent-sshrt-test-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("karakuri-sshrt-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -858,7 +858,7 @@ if [[ "$script" == cd\ * && "$script" == *"exec cargo"* ]]; then
     echo "error: simulated compile failure" >&2
     exit 101
   fi
-  echo "    Checking myagent-ssh-fixture v0.1.0"
+  echo "    Checking karakuri-ssh-fixture v0.1.0"
   echo "    Finished \`check\` profile [unoptimized + debuginfo] target(s) in 0.01s"
   echo ran >> cargo-ran.txt
   exit 0
@@ -973,7 +973,7 @@ exit $?
         assert_eq!(out.code, 0);
         assert!(
             out.output
-                .contains("Checking myagent-ssh-fixture")
+                .contains("Checking karakuri-ssh-fixture")
         );
         assert!(backing.join("cargo-ran.txt").exists());
 

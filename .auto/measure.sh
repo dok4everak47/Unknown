@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# measure.sh — pi-autoresearch benchmark for myagent (Rust project)
+# measure.sh — pi-autoresearch benchmark for karakuri (Rust project)
 #
 # Primary metric: <WORKLOAD> wall-clock time in seconds (lower is better)
 #
@@ -56,8 +56,8 @@ time_ms() {
 
 # Fail hard when the release binary is missing — no binary_kb=0 fallback.
 require_release_binary() {
-  [ -f target/release/myagent ] || {
-    echo "ERROR: target/release/myagent not found — run WORKLOAD=build first" >&2
+  [ -f target/release/karakuri ] || {
+    echo "ERROR: target/release/karakuri not found — run WORKLOAD=build first" >&2
     exit 1
   }
 }
@@ -82,7 +82,7 @@ case "$WORKLOAD" in
   build)
     build_ms="$(time_ms cargo build --release --quiet)"
     require_release_binary
-    size_kb="$(du -sk target/release/myagent | awk '{print $1}')"
+    size_kb="$(du -sk target/release/karakuri | awk '{print $1}')"
     echo "METRIC build_seconds=$(ms_to_s "$build_ms")"
     echo "METRIC binary_kb=${size_kb}"
     ;;
@@ -92,7 +92,7 @@ case "$WORKLOAD" in
     ;;
   size)
     require_release_binary
-    size_kb="$(du -sk target/release/myagent | awk '{print $1}')"
+    size_kb="$(du -sk target/release/karakuri | awk '{print $1}')"
     echo "METRIC binary_kb=${size_kb}"
     ;;
   *)

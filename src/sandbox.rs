@@ -13,7 +13,7 @@
 //! - 文件操作（`read_file` / `write_file` / `read_dir`）**不经沙箱**，直接
 //!   委托内层 runtime（Agent 自身的文件工具已有 `resolve_within` 边界 +
 //!   Capabilities 门；沙箱约束的是 cargo / build.rs 这类衍生进程）。
-//! - 与 `Capabilities`（`MYAGENT_READ_ONLY`）正交可组合，与 `MYAGENT_RUNTIME`
+//! - 与 `Capabilities`（`KARAKURI_READ_ONLY`）正交可组合，与 `KARAKURI_RUNTIME`
 //!   （local / nix）正交可组合（NixRuntime 在内层时，`sandbox-exec` 包裹
 //!   `nix develop --command ...`，策略对整个进程树生效）。
 //! - 构造时验证 macOS + `/usr/bin/sandbox-exec` 存在，否则返回清晰 `io::Error`，
@@ -44,7 +44,7 @@ pub struct SandboxedRuntime {
     root: PathBuf,
     /// canonicalize 后的临时目录（写入策略的 `<TMPDIR>`）。
     tmpdir: PathBuf,
-    /// 是否在沙箱内放开网络（`MYAGENT_SANDBOX_NETWORK=1/true`）。
+    /// 是否在沙箱内放开网络（`KARAKURI_SANDBOX_NETWORK=1/true`）。
     network: bool,
     /// 执行参数（当前只有 exec 超时）。
     config: RuntimeConfig,
@@ -218,7 +218,7 @@ mod tests {
     fn temp_root() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("myagent-sandbox-test-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("karakuri-sandbox-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -515,7 +515,7 @@ mod tests {
         let out = run_sh(&rt_on, &root, &probe);
         assert_eq!(
             out.code, 0,
-            "network must work when opted in (MYAGENT_SANDBOX_NETWORK=1); output: {}",
+            "network must work when opted in (KARAKURI_SANDBOX_NETWORK=1); output: {}",
             out.output
         );
 
@@ -623,7 +623,7 @@ fn main() {
         let home = base.join("home");
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("victim-c.txt"), "untouched").unwrap();
-        write_probe_project(&project, "myagent_malicious_probe", MALICIOUS_BUILD_RS);
+        write_probe_project(&project, "karakuri_malicious_probe", MALICIOUS_BUILD_RS);
 
         // 注入的 TMPDIR = 项目内 tmp（允许写）；伪造 HOME 在 base 下，
         // 不落在 ROOT 或注入 TMPDIR 内 → 沙箱内写被拒。
@@ -705,7 +705,7 @@ fn main() {
 
         // ---- 对照组：无害 build.rs 在沙箱内构建必须成功（策略不过严）----
         let control = base.join("control");
-        write_probe_project(&control, "myagent_control_probe", HARMLESS_BUILD_RS);
+        write_probe_project(&control, "karakuri_control_probe", HARMLESS_BUILD_RS);
         let rt_ctrl = SandboxedRuntime::for_test(
             &control,
             &control.join("tmp"),

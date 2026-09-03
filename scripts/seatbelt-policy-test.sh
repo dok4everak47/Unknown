@@ -67,7 +67,7 @@ sbx /bin/sh -c "echo ok > $CTMP/t.txt" && [ -f "$TMP/t.txt" ] && ok "TMPDIR 内�
 echo "== 3. 网络默认关 =="
 sbx /bin/sh -c "bash -c 'echo > /dev/tcp/1.1.1.1/80'" 2>/dev/null && bad "默认策略下网络竟然通" || ok "默认网络被拒"
 
-echo "== 4. MYAGENT_SANDBOX_NETWORK=1 等价策略：网络放行 =="
+echo "== 4. KARAKURI_SANDBOX_NETWORK=1 等价策略：网络放行 =="
 POLICY_ON="(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"$CROOT\"))(allow file-write* (subpath \"$CTMP\"))"
 "$SANDBOX_EXEC" -p "$POLICY_ON" /bin/sh -c "bash -c 'echo > /dev/tcp/1.1.1.1/80'" 2>/dev/null \
   && ok "opt-in 后网络放行" || echo "  ⚠️  opt-in 网络探测失败（检查代理/网络环境，不影响写隔离结论）"

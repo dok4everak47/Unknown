@@ -41,19 +41,19 @@ Final Response
 当前代码位置：
 
 ```text
-src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session、REPL 行编辑：tty 下 rustyline——Ctrl+L 清屏 / ↑↓ 历史 / 行内编辑、`.myagent_history` 持久化，非 tty 走 BufRead::lines()）
+src/main.rs      CLI entrypoint（输入输出、加载 .env 配置、创建 Model / Agent、选择 Runtime/Capabilities、加载/保存 session、REPL 行编辑：tty 下 rustyline——Ctrl+L 清屏 / ↑↓ 历史 / 行内编辑、`.karakuri_history` 持久化，非 tty 走 BufRead::lines()）
 src/config.rs    .env 配置加载（KEY=VALUE；环境变量优先于 .env；纯 std 解析）
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试；工具调用分发处打 stderr 进度行 🔧/🚫，test 构建下 no-op）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider + SSE 流式（complete_streaming；blocking 客户端超时：连接 10s / 非流式整体 120s，流式不设整体 timeout，读取空闲超时 120s（收到字节即重置，SSE 安全）；ReasoningDelta 事件（仅展示、不进对话历史））
 src/tool.rs      Tool 抽象 + read_file + write_file + search + list_dir + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
 src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
-src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command（exec 超时可配置：RuntimeConfig，MYAGENT_EXEC_TIMEOUT_SECS，默认 60s）
+src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command（exec 超时可配置：RuntimeConfig，KARAKURI_EXEC_TIMEOUT_SECS，默认 60s）
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
-src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 macOS Seatbelt 沙箱（/usr/bin/sandbox-exec + SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；MYAGENT_SANDBOX / MYAGENT_SANDBOX_NETWORK 控制），文件操作委托内层 runtime
-src/ssh_runtime.rs   SshRuntime：Runtime 第三实现（读/写文件、列目录、exec 全部经系统 `ssh`（零新依赖）转发到远程主机；路径映射 + base64 over the wire + stdout/stderr 分离，BatchMode=yes 绝不提示密码；MYAGENT_RUNTIME=ssh + MYAGENT_SSH_HOST/PORT/ROOT）
+src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 macOS Seatbelt 沙箱（/usr/bin/sandbox-exec + SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；KARAKURI_SANDBOX / KARAKURI_SANDBOX_NETWORK 控制），文件操作委托内层 runtime
+src/ssh_runtime.rs   SshRuntime：Runtime 第三实现（读/写文件、列目录、exec 全部经系统 `ssh`（零新依赖）转发到远程主机；路径映射 + base64 over the wire + stdout/stderr 分离，BatchMode=yes 绝不提示密码；KARAKURI_RUNTIME=ssh + KARAKURI_SSH_HOST/PORT/ROOT）
 src/session.rs   conversation 持久化（Session::load / Session::save）
-src/ui.rs        终端富文本 UI：Ui 结构体持有着色开关 + ANSI 样式方法（dim/bold/italic/green/cyan/red/yellow 及组合），color_enabled 纯函数计算开关（is_terminal × NO_COLOR × MYAGENT_NO_COLOR），零依赖、可单测；禁用时输出与纯文本逐字一致
+src/ui.rs        终端富文本 UI：Ui 结构体持有着色开关 + ANSI 样式方法（dim/bold/italic/green/cyan/red/yellow 及组合），color_enabled 纯函数计算开关（is_terminal × NO_COLOR × KARAKURI_NO_COLOR），零依赖、可单测；禁用时输出与纯文本逐字一致
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦；
@@ -70,29 +70,29 @@ Model → Response::ToolCall → Agent → Tool → Runtime → Filesystem
   在 flake.nix 声明的可复现 devShell 中执行（不改变文件语义）；
 - `SshRuntime` — 读/写文件、列目录、exec 全部经系统 `ssh`（`-T -o
   BatchMode=yes -o ConnectTimeout=10`，零新依赖）转发到远程主机执行；
-  myagent 仍在本机运行、终端体验不变，只是“文件系统”与“进程”落在远程：
+  karakuri 仍在本机运行、终端体验不变，只是“文件系统”与“进程”落在远程：
   本机绝对路径映射为远程路径，文件内容 base64 over the wire，exec 在远程根
   以 `cd '<root>' && exec <cmd>` 运行。启动时探测连通性/免密并解析远程根
-  （`MYAGENT_SSH_ROOT` 或远程 home）。
+  （`KARAKURI_SSH_ROOT` 或远程 home）。
 
-CLI 通过 `MYAGENT_RUNTIME` 环境变量选择：`local`（默认）/ `nix`（构造时验证
-nix 可用）/ `ssh`（`MYAGENT_SSH_HOST` 必填，`MYAGENT_SSH_PORT` 默认 22，
-`MYAGENT_SSH_ROOT` 默认远程 home）。
+CLI 通过 `KARAKURI_RUNTIME` 环境变量选择：`local`（默认）/ `nix`（构造时验证
+nix 可用）/ `ssh`（`KARAKURI_SSH_HOST` 必填，`KARAKURI_SSH_PORT` 默认 22，
+`KARAKURI_SSH_ROOT` 默认远程 home）。
 
-再外层是可选装饰器 `SandboxedRuntime`（`MYAGENT_SANDBOX=1/true` 启用，**默认关**）：
+再外层是可选装饰器 `SandboxedRuntime`（`KARAKURI_SANDBOX=1/true` 启用，**默认关**）：
 `exec` 被包装为 `sandbox-exec -p <policy> <cmd>`，把 cargo 及其衍生的 build.rs /
 proc-macro / 测试二进制放进 macOS Seatbelt 沙箱；文件操作仍直接委托内层 runtime。
-`MYAGENT_SANDBOX_NETWORK=1/true` 显式放行沙箱内网络（默认关，不随
-`MYAGENT_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec` 不存在
-→ 构造失败、清晰报错并退出，**绝不静默降级为不隔离**。与 `MYAGENT_RUNTIME`（local /
-nix / ssh）、`MYAGENT_READ_ONLY` 三方正交可组合。
-**已验证局限**：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
+`KARAKURI_SANDBOX_NETWORK=1/true` 显式放行沙箱内网络（默认关，不随
+`KARAKURI_SANDBOX=1` 隐式开启）。启用时若非 macOS 或 `/usr/bin/sandbox-exec` 不存在
+→ 构造失败、清晰报错并退出，**绝不静默降级为不隔离**。与 `KARAKURI_RUNTIME`（local /
+nix / ssh）、`KARAKURI_READ_ONLY` 三方正交可组合。
+**已验证局限**：`KARAKURI_RUNTIME=nix` + `KARAKURI_SANDBOX=1`（sandbox-exec 包
 `nix develop`）当前不可用——nix 需在 `$HOME/.cache/nix` /
 `$HOME/.local/state/nix` 写锁文件，被策略拒绝；不为之放宽 $HOME 写权限。
-等效用法：在 `nix develop` shell 内启动 agent + `MYAGENT_SANDBOX=1`
+等效用法：在 `nix develop` shell 内启动 agent + `KARAKURI_SANDBOX=1`
 （工具链仍是 nix 的，隔离效果相同，已端到端验证）。
 
-权限分化由 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
+权限分化由 `KARAKURI_READ_ONLY` 控制（与 `KARAKURI_RUNTIME` 正交可组合）：
 取值为 `1` / `true`（大小写不敏感）时启用只读模式——`write_file` / `edit_file`
 与 `exec` 在工具分发处被能力门拦下，拒绝作为 Tool Result 回传 Model，不触碰 Runtime；
 其余取值 / 未设置一律按“全允许”处理，默认行为零变化。
@@ -377,7 +377,7 @@ Waiting for approval.
 - [x] exec
 - [x] Runtime abstraction
 - [x] Nix Runtime
-- [x] Sandbox（Seatbelt 真实隔离，MYAGENT_SANDBOX）
+- [x] Sandbox（Seatbelt 真实隔离，KARAKURI_SANDBOX）
 ```
 
 ### Workflow
@@ -421,7 +421,7 @@ AI 仍然必须遵守现有规则：
   - `cargo build` 编译时间（秒）
   - `cargo check` 检查时间（秒）
   - `cargo test` 测试时间（秒）
-  - 二进制体积（KB，`du -sk target/release/myagent`）
+  - 二进制体积（KB，`du -sk target/release/karakuri`）
 - 不适合：新功能、新工具、架构变更（这些仍走正常的审批流程）。
 
 ### 会话结构
@@ -478,7 +478,7 @@ Model
 Conversation
 Agent Loop
 Tool Calling
-streaming（SSE 流式输出，complete_streaming；读取空闲超时 120s；推理过程可选显示，MYAGENT_SHOW_REASONING=1）
+streaming（SSE 流式输出，complete_streaming；读取空闲超时 120s；推理过程可选显示，KARAKURI_SHOW_REASONING=1）
 read_file
 write_file
 search
@@ -487,11 +487,11 @@ edit_file
 exec（受控开发命令，白名单）
 session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
-Nix Runtime（NixRuntime：exec 落在 nix devShell，MYAGENT_RUNTIME 选择）
-SSH Runtime（SshRuntime：读/写文件、列目录、exec 全部经系统 `ssh` 转发到远程主机，零新依赖；MYAGENT_RUNTIME=ssh + MYAGENT_SSH_HOST/PORT/ROOT）
-Capability-based execution（Capabilities 权限门，MYAGENT_READ_ONLY=1/true 只读模式）
-Sandbox（SandboxedRuntime 装饰器：exec 经 sandbox-exec 放进 macOS Seatbelt 沙箱，MYAGENT_SANDBOX=1/true 启用，MYAGENT_SANDBOX_NETWORK=1/true 放行网络；文件操作委托内层 runtime）
-Runtime config（RuntimeConfig：exec 超时可配置，MYAGENT_EXEC_TIMEOUT_SECS 秒，默认 60）
+Nix Runtime（NixRuntime：exec 落在 nix devShell，KARAKURI_RUNTIME 选择）
+SSH Runtime（SshRuntime：读/写文件、列目录、exec 全部经系统 `ssh` 转发到远程主机，零新依赖；KARAKURI_RUNTIME=ssh + KARAKURI_SSH_HOST/PORT/ROOT）
+Capability-based execution（Capabilities 权限门，KARAKURI_READ_ONLY=1/true 只读模式）
+Sandbox（SandboxedRuntime 装饰器：exec 经 sandbox-exec 放进 macOS Seatbelt 沙箱，KARAKURI_SANDBOX=1/true 启用，KARAKURI_SANDBOX_NETWORK=1/true 放行网络；文件操作委托内层 runtime）
+Runtime config（RuntimeConfig：exec 超时可配置，KARAKURI_EXEC_TIMEOUT_SECS 秒，默认 60）
 .env 配置文件（工作目录 .env 自动加载，环境变量优先；模板见 .env.example）
 ```
 

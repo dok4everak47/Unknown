@@ -26,25 +26,25 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// 默认会话文件路径；可用 `MYAGENT_SESSION` 环境变量覆盖。
+/// 默认会话文件路径；可用 `KARAKURI_SESSION` 环境变量覆盖。
 fn session_path() -> PathBuf {
-    env::var("MYAGENT_SESSION")
+    env::var("KARAKURI_SESSION")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("session.json"))
 }
 
 /// 解析历史文件路径（纯函数，便于单测）：未设置 / 空串 → 默认
-/// `<cwd>/.myagent_history`；否则使用给定路径。风格对齐 [`session_path`]。
+/// `<cwd>/.karakuri_history`；否则使用给定路径。风格对齐 [`session_path`]。
 fn history_path_from(value: Option<String>) -> PathBuf {
     match value {
         Some(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => PathBuf::from(".myagent_history"),
+        _ => PathBuf::from(".karakuri_history"),
     }
 }
 
-/// 默认历史文件路径；可用 `MYAGENT_HISTORY` 环境变量覆盖。
+/// 默认历史文件路径；可用 `KARAKURI_HISTORY` 环境变量覆盖。
 fn history_path() -> PathBuf {
-    history_path_from(env::var("MYAGENT_HISTORY").ok())
+    history_path_from(env::var("KARAKURI_HISTORY").ok())
 }
 
 /// SSH Runtime 的启动横幅信息（主机 + 远程根），供 `main` 打印状态。
@@ -55,7 +55,7 @@ struct SshBanner {
     remote_root: PathBuf,
 }
 
-/// 工具执行 Runtime 的选择：`MYAGENT_RUNTIME=local`（默认）/ `nix` / `ssh`。
+/// 工具执行 Runtime 的选择：`KARAKURI_RUNTIME=local`（默认）/ `nix` / `ssh`。
 ///
 /// 返回 `(runtime, Option<SshBanner>)`；ssh 时 `Some(banner)`（供启动横幅显示
 /// 主机与远程根），其余为 `None`。
@@ -63,11 +63,11 @@ struct SshBanner {
 /// 返回 `Err(String)` 表示配置无效或 nix / ssh 不可用，调用方据此清晰报错并
 /// exit 1。`config` 携带执行参数（当前只有 exec 超时），传给选中的 Runtime。
 fn build_runtime(config: RuntimeConfig) -> Result<(Box<dyn Runtime>, Option<SshBanner>), String> {
-    let value = match env::var("MYAGENT_RUNTIME") {
+    let value = match env::var("KARAKURI_RUNTIME") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => "local".to_string(),
         Err(env::VarError::NotUnicode(_)) => {
-            return Err("MYAGENT_RUNTIME must be valid UTF-8".to_string());
+            return Err("KARAKURI_RUNTIME must be valid UTF-8".to_string());
         }
     };
 
@@ -76,27 +76,27 @@ fn build_runtime(config: RuntimeConfig) -> Result<(Box<dyn Runtime>, Option<SshB
         "nix" => match crate::nix_runtime::NixRuntime::new(config) {
             Ok(runtime) => Ok((Box::new(runtime), None)),
             Err(err) => Err(format!(
-                "MYAGENT_RUNTIME=nix but nix is not available: {err}\n  install nix (https://nixos.org/download) or use MYAGENT_RUNTIME=local"
+                "KARAKURI_RUNTIME=nix but nix is not available: {err}\n  install nix (https://nixos.org/download) or use KARAKURI_RUNTIME=local"
             )),
         },
         "ssh" => {
-            // 主机（必填）：MYAGENT_SSH_HOST，可含 user@；缺失/非法 → 清晰报错。
-            let host = match ssh_host_from(env::var("MYAGENT_SSH_HOST").ok()) {
+            // 主机（必填）：KARAKURI_SSH_HOST，可含 user@；缺失/非法 → 清晰报错。
+            let host = match ssh_host_from(env::var("KARAKURI_SSH_HOST").ok()) {
                 Ok(host) => host,
                 Err(msg) => {
-                    return Err(format!("MYAGENT_RUNTIME=ssh but {msg}"));
+                    return Err(format!("KARAKURI_RUNTIME=ssh but {msg}"));
                 }
             };
-            // 端口：MYAGENT_SSH_PORT（可选，默认 22）；非法 → 清晰报错。
-            let port = match env::var("MYAGENT_SSH_PORT") {
+            // 端口：KARAKURI_SSH_PORT（可选，默认 22）；非法 → 清晰报错。
+            let port = match env::var("KARAKURI_SSH_PORT") {
                 Ok(value) => match parse_ssh_port(&value) {
                     Ok(port) => port,
-                    Err(msg) => return Err(format!("MYAGENT_SSH_PORT is invalid: {msg}")),
+                    Err(msg) => return Err(format!("KARAKURI_SSH_PORT is invalid: {msg}")),
                 },
                 Err(_) => 22,
             };
-            // 远程根：MYAGENT_SSH_ROOT（可选，默认远程 home）。
-            let remote_root = env::var("MYAGENT_SSH_ROOT")
+            // 远程根：KARAKURI_SSH_ROOT（可选，默认远程 home）。
+            let remote_root = env::var("KARAKURI_SSH_ROOT")
                 .ok()
                 .map(PathBuf::from);
             match SshRuntime::new(config, &host, port, remote_root.as_deref()) {
@@ -107,16 +107,16 @@ fn build_runtime(config: RuntimeConfig) -> Result<(Box<dyn Runtime>, Option<SshB
                     };
                     Ok((Box::new(runtime), Some(banner)))
                 }
-                Err(err) => Err(format!("MYAGENT_RUNTIME=ssh failed to initialize: {err}")),
+                Err(err) => Err(format!("KARAKURI_RUNTIME=ssh failed to initialize: {err}")),
             }
         }
         other => Err(format!(
-            "unknown MYAGENT_RUNTIME value: {other:?} (expected \"local\", \"nix\", or \"ssh\")"
+            "unknown KARAKURI_RUNTIME value: {other:?} (expected \"local\", \"nix\", or \"ssh\")"
         )),
     }
 }
 
-/// 解析 `MYAGENT_SSH_HOST`：缺失 / 空串 → `Err`；合法则原样返回
+/// 解析 `KARAKURI_SSH_HOST`：缺失 / 空串 → `Err`；合法则原样返回
 /// （可含 `user@` 前缀，如 `dok@192.168.64.11`）。
 ///
 /// 纯函数（不读 env、无副作用），便于单元测试。
@@ -124,13 +124,13 @@ fn ssh_host_from(value: Option<String>) -> Result<String, String> {
     match value {
         Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
         _ => Err(
-            "MYAGENT_SSH_HOST is not set; set it to the remote host (optionally user@host)"
+            "KARAKURI_SSH_HOST is not set; set it to the remote host (optionally user@host)"
                 .to_string(),
         ),
     }
 }
 
-/// 解析 `MYAGENT_SSH_PORT`：1..=65535 的整数 → `Ok`；否则 → `Err`。
+/// 解析 `KARAKURI_SSH_PORT`：1..=65535 的整数 → `Ok`；否则 → `Err`。
 ///
 /// 纯函数（不读 env、无副作用），便于单元测试。
 fn parse_ssh_port(value: &str) -> Result<u16, String> {
@@ -144,7 +144,7 @@ fn parse_ssh_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-/// 解析 `MYAGENT_EXEC_TIMEOUT_SECS`：正整数秒 → `Ok`；0、非数字、溢出 → `Err`。
+/// 解析 `KARAKURI_EXEC_TIMEOUT_SECS`：正整数秒 → `Ok`；0、非数字、溢出 → `Err`。
 ///
 /// 纯函数（不读 env、无副作用），便于单元测试；调用方对 `Err` 打印清晰错误
 /// 并 exit 1（与 nix 不可用的处理风格一致）。
@@ -161,42 +161,42 @@ fn parse_exec_timeout(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
-/// 只读模式：`MYAGENT_READ_ONLY` 取值为 `1` / `true`（大小写不敏感）时启用。
+/// 只读模式：`KARAKURI_READ_ONLY` 取值为 `1` / `true`（大小写不敏感）时启用。
 ///
 /// 其余取值（含未设置、非法取值）一律按“非只读”处理，保持默认行为零变化。
 fn read_only_mode() -> bool {
-    match env::var("MYAGENT_READ_ONLY") {
+    match env::var("KARAKURI_READ_ONLY") {
         Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
         Err(_) => false,
     }
 }
 
-/// 沙箱开关：`MYAGENT_SANDBOX` 取值为 `1` / `true`（大小写不敏感）时启用，
-/// **默认关**。与 `MYAGENT_RUNTIME`、`MYAGENT_READ_ONLY` 正交可组合。
+/// 沙箱开关：`KARAKURI_SANDBOX` 取值为 `1` / `true`（大小写不敏感）时启用，
+/// **默认关**。与 `KARAKURI_RUNTIME`、`KARAKURI_READ_ONLY` 正交可组合。
 fn sandbox_mode() -> bool {
-    match env::var("MYAGENT_SANDBOX") {
+    match env::var("KARAKURI_SANDBOX") {
         Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
         Err(_) => false,
     }
 }
 
-/// 沙箱内放开网络：`MYAGENT_SANDBOX_NETWORK` 取值为 `1` / `true` 时启用，
-/// **默认关**，不随 `MYAGENT_SANDBOX=1` 隐式开启（用户侧显式 opt-in）。
+/// 沙箱内放开网络：`KARAKURI_SANDBOX_NETWORK` 取值为 `1` / `true` 时启用，
+/// **默认关**，不随 `KARAKURI_SANDBOX=1` 隐式开启（用户侧显式 opt-in）。
 fn sandbox_network() -> bool {
-    match env::var("MYAGENT_SANDBOX_NETWORK") {
+    match env::var("KARAKURI_SANDBOX_NETWORK") {
         Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
         Err(_) => false,
     }
 }
 
-/// 推理过程显示开关：`MYAGENT_SHOW_REASONING` 取值为 `1` / `true`（大小写不敏感）
+/// 推理过程显示开关：`KARAKURI_SHOW_REASONING` 取值为 `1` / `true`（大小写不敏感）
 /// 时启用，**默认关**。开启时流式响应中模型的 `reasoning_content` 以暗色 💭
 /// 前缀实时显示（仅"路过"展示，绝不进入对话历史 / conversation）。
 fn show_reasoning_mode() -> bool {
-    show_reasoning_from(env::var("MYAGENT_SHOW_REASONING").ok())
+    show_reasoning_from(env::var("KARAKURI_SHOW_REASONING").ok())
 }
 
-/// 解析 `MYAGENT_SHOW_REASONING`（纯函数，便于单测）：`1` / `true`（大小写
+/// 解析 `KARAKURI_SHOW_REASONING`（纯函数，便于单测）：`1` / `true`（大小写
 /// 不敏感）→ `true`；其余取值 / 未设置 → `false`。风格对齐
 /// `read_only_mode` / `sandbox_mode`，默认关、行为零变化。
 fn show_reasoning_from(value: Option<String>) -> bool {
@@ -209,12 +209,12 @@ fn show_reasoning_from(value: Option<String>) -> bool {
 /// 为一个输出流（stdout / stderr）计算着色开关（其各自的 `is_terminal()`）。
 ///
 /// 须在 `load_dotenv` **之后**调用，使 `.env` 中的 `NO_COLOR` /
-/// `MYAGENT_NO_COLOR` 生效。风格对齐 `sandbox_mode()` / `show_reasoning_mode()`。
+/// `KARAKURI_NO_COLOR` 生效。风格对齐 `sandbox_mode()` / `show_reasoning_mode()`。
 fn build_ui(stream_is_terminal: bool) -> Ui {
     Ui::new(color_enabled(
         stream_is_terminal,
         env::var("NO_COLOR").ok().as_deref(),
-        env::var("MYAGENT_NO_COLOR").ok().as_deref(),
+        env::var("KARAKURI_NO_COLOR").ok().as_deref(),
     ))
 }
 
@@ -230,7 +230,7 @@ fn run_turn<M: Model>(
     ui_stdout: &Ui,
     ui_stderr: &Ui,
 ) {
-    // 推理过程显示开关：MYAGENT_SHOW_REASONING=1/true 时，模型 reasoning_content
+    // 推理过程显示开关：KARAKURI_SHOW_REASONING=1/true 时，模型 reasoning_content
     // 以暗色 💭 前缀实时显示（仅"路过"展示，不进对话历史）；默认关，行为零变化。
     let show_reasoning = show_reasoning_mode();
     // 流式：收到第一个 TextDelta 时惰性打印 "AI: " 前缀，随后逐段输出并 flush；
@@ -436,7 +436,7 @@ fn noninteractive_loop<M: Model>(
 
 fn main() {
     // 先加载 .env（工作目录）；真实环境变量优先，.env 仅兜底。
-    // .env 可能声明 NO_COLOR / MYAGENT_NO_COLOR，故着色开关须在加载之后计算。
+    // .env 可能声明 NO_COLOR / KARAKURI_NO_COLOR，故着色开关须在加载之后计算。
     if let Err(err) = config::load_dotenv(std::path::Path::new(".env")) {
         // .env 读取失败时未注入任何变量，此处的 stderr UI 仅基于真实环境变量。
         let stderr_ui = build_ui(io::stderr().is_terminal());
@@ -460,16 +460,16 @@ fn main() {
 
     let model = OpenAICompatibleModel::new(api_key);
 
-    // exec 超时配置：MYAGENT_EXEC_TIMEOUT_SECS（秒）；未设置 → 默认 60s。
+    // exec 超时配置：KARAKURI_EXEC_TIMEOUT_SECS（秒）；未设置 → 默认 60s。
     // 设置了但非法（0 / 非数字 / 溢出）→ 清晰报错并退出（与 nix 不可用一致）。
     // 启动横幅不打印超时（避免噪声）。
-    let config = match env::var("MYAGENT_EXEC_TIMEOUT_SECS") {
+    let config = match env::var("KARAKURI_EXEC_TIMEOUT_SECS") {
         Ok(value) => match parse_exec_timeout(&value) {
             Ok(exec_timeout) => RuntimeConfig { exec_timeout },
             Err(msg) => {
                 eprintln!(
                     "{}",
-                    ui_stderr.red(&format!("MYAGENT_EXEC_TIMEOUT_SECS is invalid: {msg}"))
+                    ui_stderr.red(&format!("KARAKURI_EXEC_TIMEOUT_SECS is invalid: {msg}"))
                 );
                 std::process::exit(1);
             }
@@ -477,7 +477,7 @@ fn main() {
         Err(_) => RuntimeConfig::default(),
     };
 
-    // Runtime 选择：MYAGENT_RUNTIME=local（默认）/ nix（exec 落在 devShell）/ ssh（远程）
+    // Runtime 选择：KARAKURI_RUNTIME=local（默认）/ nix（exec 落在 devShell）/ ssh（远程）
     let (runtime, ssh_banner) = match build_runtime(config.clone()) {
         Ok((runtime, banner)) => (runtime, banner),
         Err(msg) => {
@@ -486,10 +486,10 @@ fn main() {
         }
     };
 
-    // Sandbox 装饰（在 runtime 选择之后、最外层包装）：MYAGENT_SANDBOX=1/true
+    // Sandbox 装饰（在 runtime 选择之后、最外层包装）：KARAKURI_SANDBOX=1/true
     // 时，exec 经 sandbox-exec 放进 Seatbelt 沙箱；文件操作仍委托内层 runtime。
     // 启用时若非 macOS 或 sandbox-exec 不可用 → 构造失败、清晰报错并退出，
-    // 绝不静默降级为不隔离。与 Capabilities（MYAGENT_READ_ONLY）正交。
+    // 绝不静默降级为不隔离。与 Capabilities（KARAKURI_READ_ONLY）正交。
     let sandbox = sandbox_mode();
     let runtime = if sandbox {
         let network = sandbox_network();
@@ -507,7 +507,7 @@ fn main() {
             Ok(runtime) => Box::new(runtime),
             Err(err) => {
                 eprintln!("{}", ui_stderr.red(&format!(
-                    "MYAGENT_SANDBOX=1 but failed to enable sandbox: {err}\n  Seatbelt sandbox requires macOS with /usr/bin/sandbox-exec"
+                    "KARAKURI_SANDBOX=1 but failed to enable sandbox: {err}\n  Seatbelt sandbox requires macOS with /usr/bin/sandbox-exec"
                 )));
                 std::process::exit(1);
             }
@@ -516,7 +516,7 @@ fn main() {
         runtime
     };
 
-    // 能力选择：MYAGENT_READ_ONLY=1/true → 只读模式，否则全允许（行为零变化）。
+    // 能力选择：KARAKURI_READ_ONLY=1/true → 只读模式，否则全允许（行为零变化）。
     let read_only = read_only_mode();
     let capabilities = if read_only {
         Capabilities::read_only()
@@ -626,7 +626,7 @@ mod tests {
         assert!(parse_exec_timeout("99999999999999999999999999").is_err());
     }
 
-    /// MYAGENT_SHOW_REASONING 开关解析（纯函数）：`1` / `true`（大小写不敏感）→ true。
+    /// KARAKURI_SHOW_REASONING 开关解析（纯函数）：`1` / `true`（大小写不敏感）→ true。
     #[test]
     fn show_reasoning_flag_parses_truthy_values() {
         assert!(show_reasoning_from(Some("1".to_string())));
@@ -635,7 +635,7 @@ mod tests {
         assert!(show_reasoning_from(Some(" True ".to_string())));
     }
 
-    /// MYAGENT_SHOW_REASONING 开关解析（纯函数）：其余取值 / 未设置 → false
+    /// KARAKURI_SHOW_REASONING 开关解析（纯函数）：其余取值 / 未设置 → false
     /// （默认关，行为零变化）。
     #[test]
     fn show_reasoning_flag_defaults_to_off() {
@@ -646,13 +646,13 @@ mod tests {
         assert!(!show_reasoning_from(Some(String::new())));
     }
 
-    /// MYAGENT_HISTORY 未设置 → 默认 `<cwd>/.myagent_history`（相对路径）。
+    /// KARAKURI_HISTORY 未设置 → 默认 `<cwd>/.karakuri_history`（相对路径）。
     #[test]
     fn history_path_defaults_to_cwd() {
-        assert_eq!(history_path_from(None), PathBuf::from(".myagent_history"));
+        assert_eq!(history_path_from(None), PathBuf::from(".karakuri_history"));
     }
 
-    /// MYAGENT_HISTORY 设置 → 使用该路径。
+    /// KARAKURI_HISTORY 设置 → 使用该路径。
     #[test]
     fn history_path_uses_env_value() {
         assert_eq!(
@@ -666,15 +666,15 @@ mod tests {
     fn history_path_empty_env_value_uses_default() {
         assert_eq!(
             history_path_from(Some(String::new())),
-            PathBuf::from(".myagent_history")
+            PathBuf::from(".karakuri_history")
         );
         assert_eq!(
             history_path_from(Some("   ".to_string())),
-            PathBuf::from(".myagent_history")
+            PathBuf::from(".karakuri_history")
         );
     }
 
-    /// MYAGENT_SSH_HOST：缺失 / 空串 / 全空白 → Err；合法主机（可含 user@）→ Ok。
+    /// KARAKURI_SSH_HOST：缺失 / 空串 / 全空白 → Err；合法主机（可含 user@）→ Ok。
     #[test]
     fn ssh_host_required_and_validated() {
         assert!(ssh_host_from(None).is_err());
@@ -694,7 +694,7 @@ mod tests {
         );
     }
 
-    /// MYAGENT_SSH_PORT：1..=65535 → Ok；0 / 非数字 / 越界 → Err。
+    /// KARAKURI_SSH_PORT：1..=65535 → Ok；0 / 非数字 / 越界 → Err。
     #[test]
     fn ssh_port_validated() {
         assert_eq!(parse_ssh_port("22"), Ok(22));

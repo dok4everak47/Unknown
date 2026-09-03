@@ -78,13 +78,13 @@ mod tests {
     /// 每个测试一个独立 .env 路径；key 用测试独有前缀，避免并行 set_var 竞争。
     fn env_path() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("myagent-dotenv-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("karakuri-dotenv-{}-{n}", std::process::id()))
     }
 
     #[test]
     fn loads_basic_pairs_ignoring_comments_and_blanks() {
         let path = env_path();
-        let key = "MYAGENT_TEST_DOTENV_BASIC";
+        let key = "KARAKURI_TEST_DOTENV_BASIC";
         // SAFETY: 测试独有 key，并行测试互不影响。
         unsafe { std::env::remove_var(key) };
         fs::write(
@@ -103,9 +103,9 @@ mod tests {
     #[test]
     fn strips_matching_quotes() {
         let path = env_path();
-        let k1 = "MYAGENT_TEST_DOTENV_Q1";
-        let k2 = "MYAGENT_TEST_DOTENV_Q2";
-        let k3 = "MYAGENT_TEST_DOTENV_Q3";
+        let k1 = "KARAKURI_TEST_DOTENV_Q1";
+        let k2 = "KARAKURI_TEST_DOTENV_Q2";
+        let k3 = "KARAKURI_TEST_DOTENV_Q3";
         fs::write(
             &path,
             format!("{k1}=\"quoted value\"\n{k2}='single'\n{k3}=unquoted\n"),
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn does_not_override_existing_env() {
         let path = env_path();
-        let key = "MYAGENT_TEST_DOTENV_NO_OVERRIDE";
+        let key = "KARAKURI_TEST_DOTENV_NO_OVERRIDE";
         // SAFETY: 测试独有 key。
         unsafe { std::env::set_var(key, "from-env") };
         fs::write(&path, format!("{key}=from-file\n")).unwrap();
@@ -142,14 +142,14 @@ mod tests {
 
     #[test]
     fn missing_file_is_ok() {
-        let path = std::env::temp_dir().join("myagent-dotenv-does-not-exist");
+        let path = std::env::temp_dir().join("karakuri-dotenv-does-not-exist");
         assert_eq!(load_dotenv(&path).unwrap(), 0);
     }
 
     #[test]
     fn malformed_lines_are_skipped() {
         let path = env_path();
-        let key = "MYAGENT_TEST_DOTENV_MALFORMED";
+        let key = "KARAKURI_TEST_DOTENV_MALFORMED";
         // SAFETY: 测试独有 key，并行测试互不影响。
         unsafe { std::env::remove_var(key) };
         fs::write(&path, format!("no-equals-sign-here\n{key}=ok\n=emptykey\n")).unwrap();

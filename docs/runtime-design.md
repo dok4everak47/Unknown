@@ -392,7 +392,7 @@ impl Default for Capabilities {
   argv 构造为纯函数 `nix_develop_argv`（无 nix 环境下可单元测试）。
 - 两个实现共用 `run_command`（spawn + 60s 超时轮询 + stdout/stderr 合并 + 退出码），
   超时 / 输出 / 退出码语义逐字节一致（零行为回归）。
-- `Agent` 持有 `Box<dyn Runtime>`；CLI 用 `MYAGENT_RUNTIME=local|nix` 选择
+- `Agent` 持有 `Box<dyn Runtime>`；CLI 用 `KARAKURI_RUNTIME=local|nix` 选择
   （local 默认，nix 不存在时清晰报错并 exit 1）。
 - `flake.nix` `shellHook` 横幅改为仅交互式 tty 打印，避免污染
   `nix develop --command` 的输出。
@@ -434,7 +434,7 @@ Model → Response::ToolCall → Agent
 与“工具错误回传模型不中止循环”的语义一致。能力门是执行前的一道布尔检查，
 未引入权限继承、角色或策略引擎，也未修改 `Runtime` trait。
 
-CLI 用 `MYAGENT_READ_ONLY` 控制（与 `MYAGENT_RUNTIME` 正交可组合）：
+CLI 用 `KARAKURI_READ_ONLY` 控制（与 `KARAKURI_RUNTIME` 正交可组合）：
 `1` / `true`（大小写不敏感）→ `Capabilities::read_only()`；其余 / 未设置 →
 `Capabilities::default()`（全允许）。启动时在 stderr 打印一行当前模式
 （`capabilities: full` / `capabilities: read-only`）便于确认。
@@ -453,20 +453,20 @@ build.rs / proc-macro / 测试二进制）获得 OS 层真实隔离**，作为�
 - SBPL 策略（`sandbox_policy` 纯函数）：`(version 1)` + `(allow default)`，
   然后 `(deny network*)`（仅 network=off 时）、`(deny file-write*)`，最后
   仅 allow 工作目录（ROOT）与 `TMPDIR` 两个 subpath 的写；
-  `MYAGENT_SANDBOX_NETWORK=1/true` 时不输出 deny network 行。
+  `KARAKURI_SANDBOX_NETWORK=1/true` 时不输出 deny network 行。
   注意 SBPL 后匹配者生效，deny 必须在 allow 之前；ROOT/TMPDIR 注入前 canonicalize。
 - 构造安全：非 macOS 或 `/usr/bin/sandbox-exec` 不存在 →
   `io::Error`（`io::Error::other` / `ErrorKind::NotFound`，清晰报错、CLI 退出），
   **绝不静默降级为不隔离**。
-- CLI：`MYAGENT_SANDBOX=1/true` 启用（默认关）；与 `MYAGENT_READ_ONLY`
-  正交可组合；与 `MYAGENT_RUNTIME=local` 正交可组合。启动时 stderr 打印
+- CLI：`KARAKURI_SANDBOX=1/true` 启用（默认关）；与 `KARAKURI_READ_ONLY`
+  正交可组合；与 `KARAKURI_RUNTIME=local` 正交可组合。启动时 stderr 打印
   `sandbox: on (network: off)` / `sandbox: on (network: ON)`。
-  **已验证局限**：`MYAGENT_RUNTIME=nix` + `MYAGENT_SANDBOX=1`（sandbox-exec 包
+  **已验证局限**：`KARAKURI_RUNTIME=nix` + `KARAKURI_SANDBOX=1`（sandbox-exec 包
   `nix develop`）当前不可用：nix 评估 flake 需写 `$HOME/.cache/nix/
   fetcher-locks/` 与 `$HOME/.local/state/nix/profiles/`，均在 ROOT/TMPDIR 之外
   被拒；不为之放宽策略（profiles 是 GC roots / profile 符号链接）。等效且已
   端到端验证的用法：在 `nix develop` shell 内（local runtime）启动 agent +
-  `MYAGENT_SANDBOX=1`。未来路径：`XDG_CACHE_HOME`/`XDG_STATE_HOME` 重定向进
+  `KARAKURI_SANDBOX=1`。未来路径：`XDG_CACHE_HOME`/`XDG_STATE_HOME` 重定向进
   ROOT/TMPDIR（已验证 nix 尊重），需 env 注入能力，另立任务。
 - 测试：9 个单测（任何平台）+ 3 个 gated 集成测试（攻击矩阵 /
   恶意 build.rs + 无害对照组 / 网络边界），gated 测试运行时自动探测
@@ -499,7 +499,7 @@ trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 
   exec 用 `config.exec_timeout`。
 - `SandboxedRuntime::new(root, network, config, inner)`：它不调 inner.exec
   （自己 re-wrap 后调 `run_command`），故同样需要 config。
-- CLI：`MYAGENT_EXEC_TIMEOUT_SECS`（秒）——未设置 → 默认 60s；设置了但非法
+- CLI：`KARAKURI_EXEC_TIMEOUT_SECS`（秒）——未设置 → 默认 60s；设置了但非法
   （0 / 非数字 / 溢出）→ 清晰报错并 exit 1（与 nix 不可用的处理风格一致）。
   解析为纯函数 `parse_exec_timeout`（`src/main.rs`，单测覆盖）。启动横幅**不**
   打印超时（避免噪声）。
@@ -522,7 +522,7 @@ trait 不变，把沙箱作为**包裹层**加在构造链最外层，因此对 
 
 ## 12. SSH Runtime 已落地形态（2026-09-01）
 
-§5 条件 2（第二个执行 backend）再次触发：需求是把 myagent 的“文件系统与进程”
+§5 条件 2（第二个执行 backend）再次触发：需求是把 karakuri 的“文件系统与进程”
 放到远程主机——本机只做终端与 Agent 逻辑，工具的全部副作用（读/写文件、列目录、
 exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
 （`src/ssh_runtime.rs`）：
@@ -540,7 +540,7 @@ exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
 - **路径映射**：`map_path`（纯函数）把本机绝对路径 `strip_prefix(local_root)`
   后 `join` 到 `remote_root`；不在本机 root 之下 → 拒绝。`local_root` 构造时
   canonicalize（macOS `/var` → `/private/var`）；`remote_root` 启动时经 ssh 解析
-  （`MYAGENT_SSH_ROOT` 指定则 `cd '<root>' && pwd -P` 校验规范化，未指定则
+  （`KARAKURI_SSH_ROOT` 指定则 `cd '<root>' && pwd -P` 校验规范化，未指定则
   `pwd` 取远程 home）。工具层保证路径在本机 root 之内，映射失败正常不会发生。
 - **文件内容 base64 over the wire**：`read_file` 远程 `base64 -- <file>`（GNU coreutils 写法，目标 Linux 可用；macOS 远程需 `base64 -i`）（内容
   走 stdout，stderr 分离不污染）；`write_file` 本地 base64 后 `printf '%s' '…'
@@ -557,12 +557,12 @@ exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
   （忽略入参）；program/args 已被工具白名单校验为安全字符集（无 shell 元字符），
   无需引用；ssh 透传远程退出码。
 - **构造探测**：`SshRuntime::new` 先经 `ssh ... -- sh -s`（stdin 喂 `true`）
-  探测连通性 + 免密（任何失败 → 清晰 `io::Error`，提示检查 `MYAGENT_SSH_HOST` /
+  探测连通性 + 免密（任何失败 → 清晰 `io::Error`，提示检查 `KARAKURI_SSH_HOST` /
   `ssh-copy-id` / 网络防火墙），再解析远程根。`from_parts` 可注入自定义 ssh 二进制
   与 root 供测试（对齐 `sandbox.rs` 的 `from_parts` / `for_test` 模式）。gated
   假-ssh 测试断言 argv 以 `-- sh -s` 结尾且脚本来自 stdin，防回归到登录 shell 解析。
-- **CLI**：`MYAGENT_RUNTIME=ssh` 启用；`MYAGENT_SSH_HOST` 必填（可含 `user@`），
-  `MYAGENT_SSH_PORT` 默认 22（1..=65535，非法清晰报错），`MYAGENT_SSH_ROOT`
+- **CLI**：`KARAKURI_RUNTIME=ssh` 启用；`KARAKURI_SSH_HOST` 必填（可含 `user@`），
+  `KARAKURI_SSH_PORT` 默认 22（1..=65535，非法清晰报错），`KARAKURI_SSH_ROOT`
   默认远程 home。解析为纯函数 `ssh_host_from` / `parse_ssh_port`（`src/main.rs`，
   单测覆盖）。启动时 stderr 打印 `runtime: ssh (<host>)` 与
   `remote root: <path>` 便于确认。
@@ -578,6 +578,6 @@ exec）落在远程。实际落地是第三个 `Runtime` 实现 `SshRuntime`
 实际 `Runtime` trait 的四个原语（含文件读写/列目录）都被 SshRuntime 实现了——
 远程 backend 的文件语义（路径映射 + base64 传输）落在 SshRuntime 内部，
 `tool.rs` / `agent.rs` 零改动，与 `SandboxedRuntime` 装饰器、`Capabilities`
-正交可组合。`MYAGENT_RUNTIME=nix + ssh` 互斥（单值选择）；`MYAGENT_RUNTIME=ssh`
-+ `MYAGENT_SANDBOX=1` 的组合会把 `ssh` 命令本身放进 Seatbelt 沙箱（未验证、
+正交可组合。`KARAKURI_RUNTIME=nix + ssh` 互斥（单值选择）；`KARAKURI_RUNTIME=ssh`
++ `KARAKURI_SANDBOX=1` 的组合会把 `ssh` 命令本身放进 Seatbelt 沙箱（未验证、
 无默认需求，文档注明）。

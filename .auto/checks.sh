@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# checks.sh — correctness gates for pi-autoresearch (myagent / Rust project)
+# checks.sh — correctness gates for pi-autoresearch (karakuri / Rust project)
 #
 # run_experiment invokes this after every PASSING benchmark. Non-zero exit
 # → experiment logged as checks_failed and cannot be kept (code is reverted).

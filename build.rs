@@ -31,18 +31,18 @@ fn main() {
 
     // Apple ld64 (the devShell release linker) does not search nix store paths,
     // so it needs libiconv's devShell dir via -L. The nix devShell injects the
-    // path dynamically as MYAGENT_LIBICONV_LIB_DIR (see flake.nix) — no hardcoded
+    // path dynamically as KARAKURI_LIBICONV_LIB_DIR (see flake.nix) — no hardcoded
     // store hash. We emit cargo:rustc-link-arg (not -bins) so the -L also applies
     // when linking test binaries (cargo test links through the same ld64).
-    // Note: this only affects myagent's own artifacts; dependency build scripts
+    // Note: this only affects karakuri's own artifacts; dependency build scripts
     // (aws-lc-sys) link -liconv through the same ld64 and get the search path from
     // the devShell's CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS (see flake.nix).
     // When unset (plain macOS builds where iconv lives in libSystem), we emit
     // nothing and the build is unaffected.
-    if let Ok(dir) = std::env::var("MYAGENT_LIBICONV_LIB_DIR")
+    if let Ok(dir) = std::env::var("KARAKURI_LIBICONV_LIB_DIR")
         && std::path::Path::new(&dir).is_dir()
     {
         println!("cargo:rustc-link-arg=-L{}", dir);
     }
-    println!("cargo:rerun-if-env-changed=MYAGENT_LIBICONV_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=KARAKURI_LIBICONV_LIB_DIR");
 }
