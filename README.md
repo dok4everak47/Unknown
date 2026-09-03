@@ -36,7 +36,7 @@ Nix
 - [x] `search` 工具
 - [x] `list_dir` 工具（列目录，非递归一层，含 dotfile，按名排序）
 - [x] `edit_file` 工具（精确文本替换）
-- [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check`）
+- [x] `exec` 工具（受控的项目开发命令，白名单：`cargo check/test/build/clippy/fmt --check` + 只读 `git status/diff/log/show` + `KARAKURI_EXEC_ALLOW` 可配置扩展白名单）
 - [x] Runtime abstraction（`Runtime` trait + `LocalRuntime`，工具的全部副作用原语）
 - [x] Nix Runtime（`NixRuntime`：exec 经 `nix develop --command` 落在可复现 devShell）
 - [x] SSH Runtime（`SshRuntime`：读/写文件、列目录、exec 全部经系统 `ssh` 转发到远程主机，零新依赖；`KARAKURI_RUNTIME=ssh` + `KARAKURI_SSH_HOST`/`KARAKURI_SSH_PORT`/`KARAKURI_SSH_ROOT`）
@@ -179,6 +179,7 @@ KARAKURI_READ_ONLY=1 cargo run   # 只读模式：不能写文件 / 不能执行
 KARAKURI_SANDBOX=1 cargo run     # 沙箱：exec 放进 macOS Seatbelt，默认禁网
 KARAKURI_SANDBOX=1 KARAKURI_SANDBOX_NETWORK=1 cargo run  # 沙箱 + 放行网络
 KARAKURI_EXEC_TIMEOUT_SECS=300 cargo run   # exec 超时调到 300s（默认 60s；冷构建/LTO 较慢时用）
+KARAKURI_EXEC_ALLOW="git grep,npm test" cargo run   # 扩展 exec 白名单（高级 opt-in：逗号分隔，程序名 或 程序+子命令）
 KARAKURI_SHOW_REASONING=1 cargo run   # 实时显示模型推理过程（暗色 💭，不进对话历史；默认关）
 NO_COLOR=1 cargo run                 # 禁用终端着色（任意值，按 no-color.org 约定；自动检测非 tty）
 KARAKURI_NO_COLOR=1 cargo run         # 项目自己的禁色开关（取值 1/true 关闭，与 NO_COLOR 作用相同）
@@ -273,7 +274,16 @@ Pi 与 Codex 协作时，遵循 [`docs/agent-collaboration.md`](docs/agent-colla
 
 `exec` 目前是**受控的项目开发命令执行**，不是通用 shell：
 
-- 只允许白名单命令：`cargo check` / `cargo test` / `cargo build` / `cargo clippy` / `cargo fmt --check`
+- 内置白名单命令：`cargo check` / `cargo test` / `cargo build` / `cargo clippy` / `cargo fmt --check`
+  以及只读 git 子命令 `git status` / `git diff` / `git log` / `git show`。git 命令强制前置
+  `--no-pager`（关闭分页 / 外部工具执行）；定位逃逸（`-C`、`--git-dir`、`--work-tree`、
+  `--namespace`、`--super-prefix`）、配置注入/代执行（`-c`、`--config-env`）、写文件
+  （`--output`）、调用外部程序（`--ext-diff`、`--textconv`）、分页（`--paginate`）等危险
+  选项一律被拒。`git commit/push/add/checkout/reset/rm` 等写命令不放行。
+- `KARAKURI_EXEC_ALLOW`（opt-in）可显式放行额外命令：逗号分隔，每项 1 个 token = 仅程序名
+  （如 `make`）或 2 个 token = 程序 + 子命令（如 `git grep`）；放行后仍无 shell（argv 直调）、
+  参数仍走字符集校验。**这是高级 opt-in**：放行解释器（sh/bash/python/node…）或写命令
+  （rm/mv/git push…）等于放弃白名单隔离——模型可先写脚本再执行，切勿放行解释器。
 - 不使用 shell（无 `sh -c` / `bash -c`），通过 `std::process::Command` 直接传可执行文件与参数
 - 命令在项目工作目录内执行，继承当前环境变量，模型无法修改环境
 - 单次执行 60 秒超时（默认；可用 `KARAKURI_EXEC_TIMEOUT_SECS` 调整为其他秒数）；stdout / stderr / 退出码全部返回给模型

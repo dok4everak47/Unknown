@@ -109,7 +109,7 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "exec",
-            description: "Run an allowed project development command (cargo check/build/test/clippy/fmt --check). The command runs in the project directory and inherits the current environment.",
+            description: "Run an allowed project development command (cargo check/build/test/clippy/fmt --check; read-only git status/diff/log/show; plus anything explicitly allowed via KARAKURI_EXEC_ALLOW). The command runs in the project directory and inherits the current environment.",
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -347,7 +347,23 @@ impl Tool {
     ///
     /// 所有副作用都经由 `rt` 完成；`root` 是路径边界。工具自身不再直接
     /// 触碰文件系统 / 进程（那些操作全部位于 [`Runtime`] 的实现中）。
+    /// 兼容测试入口：等价于 [`Tool::execute_with_policy`] 传默认策略（空扩展白名单）。
+    ///
+    /// 仅供现有测试（~30 处 `tool.execute(&rt, &root)`）调用；二进制入口走
+    /// [`Tool::execute_with_policy`]。
+    #[allow(dead_code)]
     pub(crate) fn execute(&self, rt: &dyn Runtime, root: &Path) -> Result<String, ToolError> {
+        self.execute_with_policy(rt, root, &ExecPolicy::default())
+    }
+
+    /// 带 exec 白名单策略的执行：与 [`Tool::execute`] 语义一致，仅 `Tool::Exec`
+    /// 臂把 `policy` 传给 exec（扩展白名单），其余臂忽略 policy。
+    pub(crate) fn execute_with_policy(
+        &self,
+        rt: &dyn Runtime,
+        root: &Path,
+        policy: &ExecPolicy,
+    ) -> Result<String, ToolError> {
         match self {
             Tool::ReadFile(read_file) => read_file_within(rt, root, &read_file.path),
             Tool::WriteFile(write_file) => {
@@ -358,7 +374,7 @@ impl Tool {
             Tool::EditFile(edit_file) => {
                 edit_file_within(rt, root, &edit_file.path, &edit_file.old, &edit_file.new)
             }
-            Tool::Exec(exec) => exec_within(rt, root, &exec.command),
+            Tool::Exec(exec) => exec_within_policy(rt, root, &exec.command, policy),
         }
     }
 }
@@ -471,12 +487,76 @@ fn edit_file_within(
     Ok(format!("edited {path} successfully"))
 }
 
+/// 扩展白名单中的一条：程序名（裸命令名）+ 可选子命令。
+///
+/// 由 [`parse_exec_allow`] 从 `KARAKURI_EXEC_ALLOW` 解析得到。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdPattern {
+    /// 程序名（如 `make`），不带路径（靠 PATH 解析）。
+    pub program: String,
+    /// 可选子命令；`Some` 时仅放行 `program subcommand ...`，`None` 时放行整个程序。
+    pub subcommand: Option<String>,
+}
+
+/// exec 白名单策略：内置 cargo / 只读 git 规则之上，叠加用户显式放行的扩展白名单。
+///
+/// `Default` 为空（内置规则之外一律拒绝），保持默认行为零变化。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecPolicy {
+    /// `KARAKURI_EXEC_ALLOW` 解析出的扩展白名单。
+    pub extra_allow: Vec<CmdPattern>,
+}
+
+/// 解析 `KARAKURI_EXEC_ALLOW`：逗号分隔多项；每项 1 个 token = 仅程序名
+/// （如 `make`），2 个 token = 程序 + 子命令（如 `git grep`）；trim 后空项跳过；
+/// 每项 token 必须过 [`is_valid_arg`]，program 不得含 `/`（裸命令名，靠 PATH 解析）；
+/// token 数 > 2 或含非法字符 → `Err`（说明哪一项非法）。
+pub fn parse_exec_allow(raw: &str) -> Result<Vec<CmdPattern>, String> {
+    let mut patterns = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = item.split_whitespace().collect();
+        if tokens.len() > 2 {
+            return Err(format!(
+                "{item:?} has {} tokens (expected a program name, or \"program subcommand\")",
+                tokens.len()
+            ));
+        }
+        let program = tokens[0];
+        if program.contains('/') {
+            return Err(format!(
+                "{program:?} contains '/' — program must be a bare command name resolved via PATH"
+            ));
+        }
+        if !is_valid_arg(program) {
+            return Err(format!("{program:?} contains invalid characters"));
+        }
+        let subcommand = match tokens.get(1) {
+            Some(sub) => {
+                if !is_valid_arg(sub) {
+                    return Err(format!("{sub:?} contains invalid characters"));
+                }
+                Some(sub.to_string())
+            }
+            None => None,
+        };
+        patterns.push(CmdPattern {
+            program: program.to_string(),
+            subcommand,
+        });
+    }
+    Ok(patterns)
+}
+
 /// 结构化的允许命令：可执行文件 + 白名单参数。
 ///
-/// 由 [`ExecCommand::parse`] 从字符串解析得到，绝不包含 shell 元字符。
+/// 由 [`ExecCommand::parse_with`] 从字符串解析得到，绝不包含 shell 元字符。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecCommand {
-    /// 可执行文件名（如 `cargo`），不带路径。
+    /// 可执行文件名（如 `cargo` / `git`），不带路径。
     program: String,
     args: Vec<String>,
 }
@@ -484,54 +564,146 @@ struct ExecCommand {
 impl ExecCommand {
     /// 解析命令字符串，并对解析结果做参数级白名单校验。
     ///
-    /// 支持两种形式：
-    /// - `cargo <subcommand> [<args>...]`（白名单内）
-    /// - 单个白名单命令（如 `git status`），第一版为空集
+    /// 等价于 [`ExecCommand::parse_with`] 传空扩展白名单（内置规则之外一律拒绝）。
+    /// 仅供测试与 [`exec_within`] 使用；新代码走 [`ExecCommand::parse_with`]。
+    #[allow(dead_code)]
+    fn parse(command: &str) -> Result<Self, ToolError> {
+        Self::parse_with(command, &[])
+    }
+
+    /// 解析命令字符串，并对解析结果做参数级白名单校验。
+    ///
+    /// 白名单（内置）：
+    /// - `cargo <subcommand> [<args>...]`：`check` / `build` / `test` / `clippy`
+    ///   任意参数，`fmt` 仅 `--check`
+    /// - `git <status|diff|log|show> [<args>...]`：只读子命令，强制 `--no-pager`
+    ///   前置，危险选项（`-C` / `--git-dir` / `-c` / `--output` 等）被拒
+    ///
+    /// 可配置扩展白名单（`extra`，来自 `KARAKURI_EXEC_ALLOW`）：内置规则都不匹配时，
+    /// 若 `tokens[0]` 等于某项 program 且（无 subcommand 或 `tokens[1]` 等于该项
+    /// subcommand）则放行，参数（`tokens[1..]`）仍须过 [`is_valid_arg`]。
     ///
     /// 整个字符串按空白拆分（不支持引号，引号属于非法参数），
     /// 因此 `;`、`&&`、`|`、`>`、`$()` 等 shell 拼接无法混入。
-    fn parse(command: &str) -> Result<Self, ToolError> {
+    fn parse_with(command: &str, extra: &[CmdPattern]) -> Result<Self, ToolError> {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         if tokens.is_empty() {
             return Err(ToolError::CommandNotAllowed(command.to_string()));
         }
 
-        match tokens[0] {
-            "cargo" => {
-                let Some(sub) = tokens.get(1) else {
-                    return Err(ToolError::CommandNotAllowed(command.to_string()));
-                };
-                let args: Vec<String> = tokens[2..]
-                    .iter()
-                    .map(|t| {
-                        let s = t.to_string();
-                        if is_valid_arg(&s) {
-                            Ok(s)
-                        } else {
-                            Err(ToolError::CommandNotAllowed(s))
-                        }
-                    })
-                    .collect::<Result<_, _>>()?;
-
-                let allowed = match *sub {
-                    "check" | "build" | "test" | "clippy" => true,
-                    "fmt" => args == ["--check"],
-                    _ => false,
-                };
-                if !allowed {
-                    return Err(ToolError::CommandNotAllowed(command.to_string()));
-                }
-
-                Ok(ExecCommand {
-                    program: "cargo".to_string(),
-                    args: std::iter::once(sub.to_string())
-                        .chain(args)
-                        .collect(),
+        // 内置 cargo 规则
+        if tokens[0] == "cargo" {
+            let Some(sub) = tokens.get(1) else {
+                return Err(ToolError::CommandNotAllowed(command.to_string()));
+            };
+            let args: Vec<String> = tokens[2..]
+                .iter()
+                .map(|t| {
+                    let s = t.to_string();
+                    if is_valid_arg(&s) {
+                        Ok(s)
+                    } else {
+                        Err(ToolError::CommandNotAllowed(s))
+                    }
                 })
+                .collect::<Result<_, _>>()?;
+
+            let allowed = match *sub {
+                "check" | "build" | "test" | "clippy" => true,
+                "fmt" => args == ["--check"],
+                _ => false,
+            };
+            if !allowed {
+                return Err(ToolError::CommandNotAllowed(command.to_string()));
             }
-            other => Err(ToolError::CommandNotAllowed(other.to_string())),
+
+            return Ok(ExecCommand {
+                program: "cargo".to_string(),
+                args: std::iter::once(sub.to_string())
+                    .chain(args)
+                    .collect(),
+            });
         }
+
+        // 内置只读 git 规则：子命令命中 status/diff/log/show 时放行（`--no-pager` 前置、
+        // 危险选项被拒）；未命中（如 git grep / git commit）落入扩展白名单继续判断。
+        if tokens[0] == "git"
+            && let Some(cmd) = parse_read_only_git(&tokens)?
+        {
+            return Ok(cmd);
+        }
+
+        // 可配置扩展白名单（KARAKURI_EXEC_ALLOW）
+        for pattern in extra {
+            if pattern.program != tokens[0] {
+                continue;
+            }
+            let sub_matches = match &pattern.subcommand {
+                Some(sub) => tokens
+                    .get(1)
+                    .map(|t| *t == sub)
+                    .unwrap_or(false),
+                None => true,
+            };
+            if !sub_matches {
+                continue;
+            }
+            let args: Vec<String> = tokens[1..]
+                .iter()
+                .map(|t| {
+                    let s = t.to_string();
+                    if is_valid_arg(&s) {
+                        Ok(s)
+                    } else {
+                        Err(ToolError::CommandNotAllowed(s))
+                    }
+                })
+                .collect::<Result<_, _>>()?;
+            return Ok(ExecCommand {
+                program: pattern.program.clone(),
+                args,
+            });
+        }
+
+        Err(ToolError::CommandNotAllowed(tokens[0].to_string()))
     }
+}
+
+/// 解析只读 git 子命令（`status` / `diff` / `log` / `show`）。
+///
+/// - 命中内置只读子命令：逐参数过 [`is_valid_arg`] 与 [`is_forbidden_git_option`]，
+///   构造 `git --no-pager <sub> [<args>...]`（`--no-pager` 插在最前，杜绝
+///   pager / 外部工具执行）；
+/// - 未命中（裸 `git` 或非只读子命令，如 `git grep` / `git commit`）→ `Ok(None)`，
+///   由调用方落入扩展白名单继续判断；
+/// - 命中但含危险选项 / 非法参数 → `Err`（不可被扩展白名单覆盖）。
+fn parse_read_only_git(tokens: &[&str]) -> Result<Option<ExecCommand>, ToolError> {
+    let Some(sub) = tokens.get(1) else {
+        return Ok(None);
+    };
+    if !matches!(*sub, "status" | "diff" | "log" | "show") {
+        return Ok(None);
+    }
+
+    let args: Vec<String> = tokens[2..]
+        .iter()
+        .map(|t| {
+            let s = t.to_string();
+            if !is_valid_arg(&s) || is_forbidden_git_option(&s) {
+                Err(ToolError::CommandNotAllowed(s))
+            } else {
+                Ok(s)
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(Some(ExecCommand {
+        program: "git".to_string(),
+        args: std::iter::once("--no-pager".to_string())
+            .chain(std::iter::once(sub.to_string()))
+            .chain(args)
+            .collect(),
+    }))
 }
 
 /// 允许出现在参数中的字符：字母、数字、`-`、`_`、`.`、`/`、`=`、`:`、`+`、`#`。
@@ -546,15 +718,60 @@ fn is_valid_arg(arg: &str) -> bool {
         })
 }
 
+/// 只读 git 参数的危险选项黑名单：命中即拒绝该参数。
+///
+/// - 短选项：仅"精确等于"被拒（如 `-C` / `-c`）；
+/// - 长选项："精确等于"或"以 `--opt=` 开头"被拒（如 `--git-dir=/x`）。
+///
+/// 覆盖：定位逃逸（`-C`、`--git-dir`、`--work-tree`、`--namespace`、
+/// `--super-prefix`）、配置注入 / 代执行（`-c`、`--config-env`）、写文件
+/// （`--output`）、调用外部程序（`--ext-diff`、`--textconv`）、分页（`--paginate`）。
+fn is_forbidden_git_option(arg: &str) -> bool {
+    const FORBIDDEN_SHORT: &[&str] = &["-C", "-c"];
+    const FORBIDDEN_LONG: &[&str] = &[
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--output",
+        "--ext-diff",
+        "--textconv",
+        "--paginate",
+    ];
+
+    if FORBIDDEN_SHORT.contains(&arg) {
+        return true;
+    }
+    FORBIDDEN_LONG
+        .iter()
+        .any(|opt| arg == *opt || arg.starts_with(&format!("{opt}=")))
+}
+
+/// 在 `root` 内执行允许的开发命令，返回 `exit code` + stdout + stderr。
+///
+/// 等价于 [`exec_within_policy`] 传默认策略（空扩展白名单）。仅供测试与既有调用方使用。
+#[allow(dead_code)]
+fn exec_within(rt: &dyn Runtime, root: &Path, command: &str) -> Result<String, ToolError> {
+    exec_within_policy(rt, root, command, &ExecPolicy::default())
+}
+
 /// 在 `root` 内执行允许的开发命令，返回 `exit code` + stdout + stderr。
 ///
 /// 安全约束：
-/// - 只允许 `cargo check/build/test/clippy/fmt --check`（白名单，见 [`ExecCommand::parse`]）
+/// - 白名单：内置 `cargo check/build/test/clippy/fmt --check` + 只读 git
+///   `status/diff/log/show`（强制 `--no-pager`、危险选项被拒），叠加 `policy`
+///   声明的扩展白名单（`KARAKURI_EXEC_ALLOW`），见 [`ExecCommand::parse_with`]
 /// - 不使用 shell；进程执行位于 [`Runtime::exec`]（对应 `std::process::Command` 直调）
 /// - 工作目录固定为 `root`，继承当前环境变量（模型无法修改）
 /// - 60 秒超时，超时返回已捕获的输出
-fn exec_within(rt: &dyn Runtime, root: &Path, command: &str) -> Result<String, ToolError> {
-    let parsed = ExecCommand::parse(command)?;
+fn exec_within_policy(
+    rt: &dyn Runtime,
+    root: &Path,
+    command: &str,
+    policy: &ExecPolicy,
+) -> Result<String, ToolError> {
+    let parsed = ExecCommand::parse_with(command, &policy.extra_allow)?;
     match rt.exec(&parsed.program, &parsed.args, root) {
         Ok(ExecOutput { code, output }) => {
             if code == 0 {
@@ -1860,6 +2077,262 @@ mod tests {
         }
     }
 
+    // ---------------- exec：只读 git 子命令 ----------------
+
+    #[test]
+    fn exec_parse_allows_read_only_git_subcommands() {
+        for command in [
+            "git status",
+            "git diff --staged",
+            "git log --oneline -n 5",
+            "git show HEAD",
+        ] {
+            let cmd = ExecCommand::parse(command)
+                .unwrap_or_else(|e| panic!("should allow: {command} ({e})"));
+            assert_eq!(cmd.program, "git");
+            // argv 以 --no-pager 开头（强制关闭分页）
+            assert_eq!(cmd.args[0], "--no-pager", "command: {command}");
+        }
+    }
+
+    #[test]
+    fn exec_parse_git_argv_prepends_no_pager() {
+        let cmd = ExecCommand::parse("git log --oneline -n 5").unwrap();
+        assert_eq!(cmd.program, "git");
+        assert_eq!(cmd.args, vec!["--no-pager", "log", "--oneline", "-n", "5"]);
+    }
+
+    #[test]
+    fn exec_parse_rejects_git_write_commands() {
+        for command in [
+            "git commit",
+            "git push",
+            "git add",
+            "git checkout",
+            "git reset",
+            "git rm",
+        ] {
+            assert!(
+                matches!(
+                    ExecCommand::parse(command),
+                    Err(ToolError::CommandNotAllowed(_))
+                ),
+                "should reject: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_parse_rejects_dangerous_git_options() {
+        for command in [
+            "git -C /tmp status",
+            "git status --git-dir=/x",
+            "git -c core.pager=x log",
+            "git diff --output=x",
+            "git diff --ext-diff",
+            "git log --textconv",
+            "git --work-tree /x status",
+        ] {
+            assert!(
+                matches!(
+                    ExecCommand::parse(command),
+                    Err(ToolError::CommandNotAllowed(_))
+                ),
+                "should reject: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_parse_rejects_git_shell_metacharacters() {
+        for command in ["git status; rm -rf .", "git status && x", "git status | x"] {
+            assert!(
+                matches!(
+                    ExecCommand::parse(command),
+                    Err(ToolError::CommandNotAllowed(_))
+                ),
+                "should reject: {command}"
+            );
+        }
+    }
+
+    // ---------------- exec：git 危险选项黑名单 ----------------
+
+    #[test]
+    fn is_forbidden_git_option_rejects_dangerous_options() {
+        for arg in [
+            "-C",
+            "-c",
+            "--git-dir",
+            "--git-dir=/x",
+            "--work-tree",
+            "--work-tree=/x",
+            "--namespace",
+            "--namespace=foo",
+            "--super-prefix",
+            "--super-prefix=foo",
+            "--config-env",
+            "--config-env=VAR",
+            "--output",
+            "--output=x",
+            "--ext-diff",
+            "--ext-diff=x",
+            "--textconv",
+            "--textconv=x",
+            "--paginate",
+        ] {
+            assert!(is_forbidden_git_option(arg), "should forbid: {arg}");
+        }
+    }
+
+    #[test]
+    fn is_forbidden_git_option_allows_safe_args() {
+        for arg in [
+            "--stat",
+            "--oneline",
+            "--staged",
+            "--cached",
+            "-n",
+            "HEAD",
+            "src/main.rs",
+        ] {
+            assert!(!is_forbidden_git_option(arg), "should allow: {arg}");
+        }
+    }
+
+    // ---------------- exec：KARAKURI_EXEC_ALLOW 扩展白名单 ----------------
+
+    #[test]
+    fn parse_exec_allow_parses_program_and_subcommand() {
+        let patterns = parse_exec_allow("git grep, npm test").unwrap();
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(
+            patterns[0],
+            CmdPattern {
+                program: "git".to_string(),
+                subcommand: Some("grep".to_string()),
+            }
+        );
+        assert_eq!(
+            patterns[1],
+            CmdPattern {
+                program: "npm".to_string(),
+                subcommand: Some("test".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_exec_allow_parses_program_only() {
+        let patterns = parse_exec_allow("make").unwrap();
+        assert_eq!(
+            patterns,
+            vec![CmdPattern {
+                program: "make".to_string(),
+                subcommand: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_exec_allow_empty_and_blank_yields_empty() {
+        assert_eq!(parse_exec_allow("").unwrap(), vec![]);
+        assert_eq!(parse_exec_allow("   ").unwrap(), vec![]);
+        // 逗号间空项 / 全空白项跳过
+        assert_eq!(
+            parse_exec_allow("make, , npm test").unwrap(),
+            vec![
+                CmdPattern {
+                    program: "make".to_string(),
+                    subcommand: None,
+                },
+                CmdPattern {
+                    program: "npm".to_string(),
+                    subcommand: Some("test".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_exec_allow_rejects_invalid_entries() {
+        // 3 个 token
+        assert!(parse_exec_allow("git a b c").is_err());
+        // 引号
+        assert!(parse_exec_allow("sh 'x'").is_err());
+        // 美元符
+        assert!(parse_exec_allow("echo $HOME").is_err());
+        // program 含 '/'
+        assert!(parse_exec_allow("/bin/sh").is_err());
+        // program 含 shell 元字符
+        assert!(parse_exec_allow("make;rm").is_err());
+    }
+
+    #[test]
+    fn parse_with_extra_allow_matches_program_only() {
+        let extra = vec![CmdPattern {
+            program: "make".to_string(),
+            subcommand: None,
+        }];
+        let cmd = ExecCommand::parse_with("make build", &extra).unwrap();
+        assert_eq!(cmd.program, "make");
+        assert_eq!(cmd.args, vec!["build"]);
+        // 未配置的 npm test 拒绝
+        assert!(matches!(
+            ExecCommand::parse_with("npm test", &extra),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_with_extra_allow_matches_subcommand() {
+        let extra = vec![CmdPattern {
+            program: "git".to_string(),
+            subcommand: Some("grep".to_string()),
+        }];
+        let cmd = ExecCommand::parse_with("git grep foo", &extra).unwrap();
+        assert_eq!(cmd.program, "git");
+        assert_eq!(cmd.args, vec!["grep", "foo"]);
+        // git grep 不在内置只读列表，extra 只匹配 grep 子命令 → 其他 git 子命令拒绝
+        assert!(matches!(
+            ExecCommand::parse_with("git stash", &extra),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_with_extra_does_not_affect_cargo_rules() {
+        let extra = vec![CmdPattern {
+            program: "make".to_string(),
+            subcommand: None,
+        }];
+        let cmd = ExecCommand::parse_with("cargo check", &extra).unwrap();
+        assert_eq!(cmd.program, "cargo");
+        assert_eq!(cmd.args, vec!["check"]);
+        // cargo 规则不受 extra 影响：cargo run 仍拒绝
+        assert!(matches!(
+            ExecCommand::parse_with("cargo run", &extra),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_with_extra_args_still_validated() {
+        let extra = vec![CmdPattern {
+            program: "make".to_string(),
+            subcommand: None,
+        }];
+        // extra 放行的命令参数仍须过 is_valid_arg：shell 拼接被拒
+        assert!(matches!(
+            ExecCommand::parse_with("make build && rm -rf .", &extra),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+        assert!(matches!(
+            ExecCommand::parse_with("make build; x", &extra),
+            Err(ToolError::CommandNotAllowed(_))
+        ));
+    }
+
     #[test]
     fn exec_from_call_parses_command() {
         let args = serde_json::json!({ "command": "cargo check" });
@@ -2057,5 +2530,37 @@ mod exec_tests {
             }
             other => panic!("expected NonZeroExit, got: {other:?}"),
         }
+    }
+
+    /// 端到端 smoke：真实 git 只读命令经工具跑通（git init 后 git status 退出码 0）。
+    ///
+    /// 在临时目录内 `git init -q` 并配置最小 user，避免依赖外部仓库状态；
+    /// 证明只读 git 子命令走通真实进程（argv 带 `--no-pager`，不触发分页）。
+    #[test]
+    fn exec_git_status_passes_in_initialized_repo() {
+        let root = temp_cargo_root();
+
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git should be available in test environment")
+        };
+
+        let init = run(&["init", "-q"]);
+        assert!(init.status.success(), "git init failed: {:?}", init);
+        let email = run(&["config", "user.email", "test@example.com"]);
+        assert!(email.status.success(), "git config failed: {:?}", email);
+        let name = run(&["config", "user.name", "test"]);
+        assert!(name.status.success(), "git config failed: {:?}", name);
+
+        let tool = Tool::Exec(Exec {
+            command: "git status".to_string(),
+        });
+        let result = tool
+            .execute(&LocalRuntime::default(), &root)
+            .unwrap();
+        assert!(result.contains("exit code: 0"), "unexpected: {result}");
     }
 }

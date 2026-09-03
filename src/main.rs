@@ -18,6 +18,7 @@ use crate::model::{Model, ModelEvent, OpenAICompatibleModel};
 use crate::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 use crate::session::Session;
 use crate::ssh_runtime::SshRuntime;
+use crate::tool::{ExecPolicy, parse_exec_allow};
 use crate::ui::{Ui, color_enabled};
 
 use rustyline::error::ReadlineError;
@@ -524,7 +525,30 @@ fn main() {
         Capabilities::default()
     };
 
-    let agent = match Agent::new_with_runtime_and_caps(model, runtime, capabilities) {
+    // 可配置扩展 exec 白名单：KARAKURI_EXEC_ALLOW（逗号分隔；每项 1 个 token = 仅程序名
+    // 如 make，2 个 token = 程序+子命令 如 git grep）。.env 已由 config 层加载，直接读环境变量。
+    // 未设置 → 空扩展白名单（内置 cargo / 只读 git 之外一律拒绝，行为零变化）；
+    // 设置了但非法 → 清晰报错并退出（对齐现有非法配置的处理风格）。
+    let exec_policy = match env::var("KARAKURI_EXEC_ALLOW") {
+        Ok(raw) => match parse_exec_allow(&raw) {
+            Ok(extra_allow) => ExecPolicy { extra_allow },
+            Err(msg) => {
+                eprintln!(
+                    "{}",
+                    ui_stderr.red(&format!("KARAKURI_EXEC_ALLOW is invalid: {msg}"))
+                );
+                std::process::exit(1);
+            }
+        },
+        Err(_) => ExecPolicy::default(),
+    };
+
+    let agent = match Agent::new_with_runtime_and_caps_and_policy(
+        model,
+        runtime,
+        capabilities,
+        exec_policy,
+    ) {
         Ok(agent) => agent,
         Err(err) => {
             eprintln!(

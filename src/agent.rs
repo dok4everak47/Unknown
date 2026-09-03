@@ -2,7 +2,7 @@ use crate::capabilities::Capabilities;
 use crate::message::Message;
 use crate::model::{Model, ModelEvent, Response};
 use crate::runtime::{LocalRuntime, Runtime};
-use crate::tool::Tool;
+use crate::tool::{ExecPolicy, Tool};
 use crate::ui::Ui;
 
 use std::fmt;
@@ -97,6 +97,9 @@ pub struct Agent<M: Model> {
     runtime: Box<dyn Runtime>,
     /// 工具执行前的权限门（默认全允许，行为零变化）。
     capabilities: Capabilities,
+    /// exec 白名单策略：内置 cargo / 只读 git 之上，叠加 `KARAKURI_EXEC_ALLOW`
+    /// 解析出的扩展白名单（默认空，行为零变化）。
+    exec_policy: ExecPolicy,
 }
 
 impl<M: Model> Agent<M> {
@@ -127,12 +130,32 @@ impl<M: Model> Agent<M> {
         runtime: Box<dyn Runtime>,
         capabilities: Capabilities,
     ) -> Result<Self, std::io::Error> {
+        Self::new_with_runtime_and_caps_and_policy(
+            model,
+            runtime,
+            capabilities,
+            ExecPolicy::default(),
+        )
+    }
+
+    /// 以当前工作目录作为工具执行根目录、注入指定 Runtime、能力与 exec 白名单策略
+    /// 创建 Agent（全参构造器）。
+    ///
+    /// `exec_policy` 携带 `KARAKURI_EXEC_ALLOW` 解析出的扩展白名单，叠加在内置
+    /// cargo / 只读 git 规则之上；其余公开构造器以 [`ExecPolicy::default()`] 委托本方法。
+    pub fn new_with_runtime_and_caps_and_policy(
+        model: M,
+        runtime: Box<dyn Runtime>,
+        capabilities: Capabilities,
+        exec_policy: ExecPolicy,
+    ) -> Result<Self, std::io::Error> {
         let root = std::env::current_dir()?;
         Ok(Self {
             model,
             root,
             runtime,
             capabilities,
+            exec_policy,
         })
     }
 
@@ -146,6 +169,7 @@ impl<M: Model> Agent<M> {
             root,
             runtime: Box::new(LocalRuntime::default()),
             capabilities: Capabilities::default(),
+            exec_policy: ExecPolicy::default(),
         }
     }
 
@@ -176,6 +200,7 @@ impl<M: Model> Agent<M> {
             root,
             runtime,
             capabilities,
+            exec_policy: ExecPolicy::default(),
         }
     }
 
@@ -263,7 +288,11 @@ impl<M: Model> Agent<M> {
                             )
                         } else {
                             match Tool::from_call(&call.name, &call.arguments) {
-                                Ok(tool) => match tool.execute(self.runtime.as_ref(), &self.root) {
+                                Ok(tool) => match tool.execute_with_policy(
+                                    self.runtime.as_ref(),
+                                    &self.root,
+                                    &self.exec_policy,
+                                ) {
                                     Ok(text) => text,
                                     Err(err) => format!("tool error: {err}"),
                                 },
@@ -315,6 +344,7 @@ mod tests {
             root,
             runtime: Box::new(LocalRuntime::default()),
             capabilities: Capabilities::default(),
+            exec_policy: ExecPolicy::default(),
         }
     }
 

@@ -46,7 +46,7 @@ src/config.rs    .env 配置加载（KEY=VALUE；环境变量优先于 .env；�
 src/agent.rs     Agent Loop（Model ↔ Tool 协调、持有 Runtime、可注入 fake Model / fake Runtime 测试；工具调用分发处打 stderr 进度行 🔧/🚫，test 构建下 no-op）
 src/message.rs   conversation message 类型（Role / Message / ToolCall）
 src/model.rs     Model trait + OpenAI-compatible provider + SSE 流式（complete_streaming；blocking 客户端超时：连接 10s / 非流式整体 120s，流式不设整体 timeout，读取空闲超时 120s（收到字节即重置，SSE 安全）；ReasoningDelta 事件（仅展示、不进对话历史））
-src/tool.rs      Tool 抽象 + read_file + write_file + search + list_dir + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime）
+src/tool.rs      Tool 抽象 + read_file + write_file + search + list_dir + edit_file + exec + 路径边界校验（纯逻辑，副作用经 Runtime；exec 白名单 = cargo 5 子命令 + 只读 git status/diff/log/show + KARAKURI_EXEC_ALLOW 可配置扩展）
 src/capabilities.rs   Capabilities：工具执行前的权限门（filesystem_read / filesystem_write / process_execute）
 src/runtime.rs   Runtime trait（副作用原语）+ LocalRuntime（std 实现）+ 共享 run_command（exec 超时可配置：RuntimeConfig，KARAKURI_EXEC_TIMEOUT_SECS，默认 60s）
 src/nix_runtime.rs   NixRuntime：Runtime 第二实现（文件操作委托 LocalRuntime，exec 经 `nix develop --command` 落在 devShell）
@@ -484,7 +484,7 @@ write_file
 search
 list_dir（列目录，非递归，含 dotfile）
 edit_file
-exec（受控开发命令，白名单）
+exec（受控开发命令，白名单：cargo check/build/test/clippy/fmt --check + 只读 git status/diff/log/show，git 强制 --no-pager、危险选项被拒 + KARAKURI_EXEC_ALLOW 可配置扩展）
 session persistence（单 session 保存/恢复）
 Runtime abstraction（Runtime trait + LocalRuntime，工具副作用原语）
 Nix Runtime（NixRuntime：exec 落在 nix devShell，KARAKURI_RUNTIME 选择）
