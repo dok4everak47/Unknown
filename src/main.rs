@@ -1,6 +1,7 @@
 mod agent;
 mod capabilities;
 mod config;
+mod markdown;
 mod message;
 mod model;
 mod nix_runtime;
@@ -13,6 +14,7 @@ mod ui;
 
 use crate::agent::Agent;
 use crate::capabilities::Capabilities;
+use crate::markdown::MarkdownRenderer;
 use crate::message::Message;
 use crate::model::{Model, ModelEvent, OpenAICompatibleModel};
 use crate::runtime::{LocalRuntime, Runtime, RuntimeConfig};
@@ -240,6 +242,8 @@ fn run_turn<M: Model>(
     // 是否正处于暗色推理段（开场转义已打印、尚未复位）。
     let mut reasoning_active = false;
     let mut printed_any = false;
+    // 回答正文的流式 Markdown 渲染器（每轮新建；代码块状态不跨 turn）。
+    let mut md = MarkdownRenderer::new();
     let result = agent.run_turn_streaming(
         conversation,
         text,
@@ -257,7 +261,13 @@ fn run_turn<M: Model>(
                         print!("{}", ui_stdout.cyan_bold("AI: "));
                         prefix_printed = true;
                     }
-                    print!("{delta}");
+                    // 回答正文按 Markdown 流式渲染；着色关闭时渲染器本身逐字
+                    // 透传，这里仍分支以保证关闭路径完全不触碰渲染器（字节级一致）。
+                    if ui_stdout.enabled() {
+                        print!("{}", md.push(&delta, ui_stdout));
+                    } else {
+                        print!("{delta}");
+                    }
                     printed_any = true;
                     io::stdout()
                         .flush()
@@ -284,6 +294,12 @@ fn run_turn<M: Model>(
         },
         ui_stderr,
     );
+
+    // 冲刷渲染器残余的半行（模型回答常不以换行结尾）；match 内再补尾换行。
+    if ui_stdout.enabled() {
+        print!("{}", md.flush(ui_stdout));
+        let _ = io::stdout().flush();
+    }
 
     match result {
         Ok(()) => {

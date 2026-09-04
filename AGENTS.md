@@ -54,6 +54,7 @@ src/sandbox.rs   SandboxedRuntime 装饰器：把 exec 的衍生进程放进 mac
 src/ssh_runtime.rs   SshRuntime：Runtime 第三实现（读/写文件、列目录、exec 全部经系统 `ssh`（零新依赖）转发到远程主机；路径映射 + base64 over the wire + stdout/stderr 分离，BatchMode=yes 绝不提示密码；KARAKURI_RUNTIME=ssh + KARAKURI_SSH_HOST/PORT/ROOT）
 src/session.rs   conversation 持久化（Session::load / Session::save）
 src/ui.rs        终端富文本 UI：Ui 结构体持有着色开关 + ANSI 样式方法（dim/bold/italic/green/cyan/red/yellow 及组合），color_enabled 纯函数计算开关（is_terminal × NO_COLOR × KARAKURI_NO_COLOR），零依赖、可单测；禁用时输出与纯文本逐字一致
+src/markdown.rs  终端 Markdown 流式渲染：MarkdownRenderer 按行缓冲 SSE delta，渲染标题/粗斜体/行内代码/列表/引用/围栏代码块（dim 边框 + │ 竖线，块内不做行内解析）；着色关闭时逐字透传，零依赖、可单测；在 main.rs run_turn 的 TextDelta 分支接线
 ```
 
 核心类型与 API 层类型分离（`Message` vs `ApiMessage`）；工具执行与 Model provider 解耦；
@@ -479,6 +480,7 @@ Conversation
 Agent Loop
 Tool Calling
 streaming（SSE 流式输出，complete_streaming；读取空闲超时 120s；推理过程可选显示，KARAKURI_SHOW_REASONING=1）
+回答正文 Markdown 渲染（标题/粗斜体/行内代码/列表/引用/围栏代码块带边框竖线；纯 std + ANSI 零新依赖；非 tty / NO_COLOR 逐字透传）
 read_file
 write_file
 search

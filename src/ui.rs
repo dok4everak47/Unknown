@@ -36,6 +36,11 @@ impl Ui {
         Self { enabled }
     }
 
+    /// 当前是否启用着色（非 tty / NO_COLOR 时为 false）。
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// 包裹单个 SGR 属性；禁用时原样返回。
     fn paint(&self, sgr: &str, text: &str) -> String {
         if self.enabled {

@@ -31,6 +31,7 @@ Nix
 - [x] Streaming（SSE 流式输出：逐字显示回复，根治长请求被代理空闲超时掐断；读取空闲超时 120s 防静默挂起）
 - [x] 推理过程可选显示（`KARAKURI_SHOW_REASONING=1`：暗色 💭 前缀，仅展示、不进对话历史）
 - [x] 终端着色（ANSI 颜色层次：`You:` / `AI:` / 推理段 / 工具进度行 / 错误；`NO_COLOR` / `KARAKURI_NO_COLOR` 可关闭，非 tty 自动纯文本）
+- [x] 回答正文 Markdown 渲染（标题/粗斜体/行内代码/列表/引用/围栏代码块带边框与竖线；纯 std + ANSI，零新依赖；非 tty / `NO_COLOR` 逐字透传）
 - [x] `read_file` 工具
 - [x] `write_file` 工具
 - [x] `search` 工具
@@ -87,6 +88,7 @@ Final Response
 | `src/sandbox.rs` | `SandboxedRuntime` 装饰器：把 `exec` 的衍生进程放进 macOS Seatbelt 沙箱（`/usr/bin/sandbox-exec`，SBPL 策略 deny 全写/全网 → allow ROOT+TMPDIR；`KARAKURI_SANDBOX` / `KARAKURI_SANDBOX_NETWORK` 控制），文件操作委托内层 runtime |
 | `src/agent.rs` | Agent Loop：协调 `Model ↔ Tool` 多轮交互（可注入 fake Model 测试；工具进度行 🔧/🚫 经 `ui` 着色） |
 | `src/ui.rs` | 终端富文本 UI：`Ui` 结构体持有着色开关 + ANSI 样式方法（`dim`/`bold`/`green`/`cyan`/`red`/`yellow` 与组合），`color_enabled` 纯函数计算开关（`is_terminal` × `NO_COLOR` × `KARAKURI_NO_COLOR`），零依赖，可单测 |
+| `src/markdown.rs` | 终端 Markdown 流式渲染：`MarkdownRenderer` 按行缓冲 SSE delta，渲染标题/粗斜体/行内代码/列表/引用/围栏代码块（dim 边框 + `│` 竖线，块内不做行内解析）；着色关闭时逐字透传，零依赖，可单测 |
 | `src/session.rs` | conversation 持久化（`Session::load` / `Session::save`，JSON 格式） |
 | `src/main.rs` | CLI entrypoint：加载/保存 session，读入用户输入（tty 下 rustyline 行编辑，非 tty 走 `BufRead::lines()`），创建 Model / Agent，启动时各计算一次 stdout/stderr 着色开关，显示结果 |
 
@@ -193,7 +195,11 @@ stdout / stderr 各自独立判断（`is_terminal()`）后启用 ANSI 着色（�
 - 工具进度行 `🔧`：整条暗色，工具名青色；被拒行 `🚫`：整条红色，工具名加粗
 - 推理段（`KARAKURI_SHOW_REASONING=1`）：暗色斜体（`💭` 前缀，结束复位）
 - 启动横幅 / `caused by` 链：暗色；`warning:`：黄色；致命错误：红色
-- 回答正文永远不着色（只给标签上色，保持克制）
+- 回答正文按 **Markdown 流式渲染**（`src/markdown.rs`，零新依赖）：
+  - 标题 `#`/`##`/`###` → 青色加粗；`**粗体**` → 加粗；`*斜体*` / `_斜体_` → 斜体（`foo_bar` 这类词内下划线不误判）
+  - 行内代码 `` `code` `` → 青色；列表 `- `/`1. ` 的 marker → 暗色；引用 `> ` → 暗色斜体
+  - 围栏代码块 ```` ``` ````：围栏本身换成一条暗色横线，块内每行加暗色 `│ ` 竖线，块内 `*`/`` ` `` 原样保留（不再当 markdown 解析）
+  - 渲染只在着色开启时进行；关闭着色（见下）时正文**逐字透传**，与历史版本字节一致
 
 关闭方式（任一即可）：
 
