@@ -235,6 +235,11 @@ You: /exit
 超时、不设整体 timeout（收到字节即重置，长推理不误杀），但流式读取 120s 无
 任何数据会超时报错（如代理静默持有连接不吐字节），报错后可直接重试。
 
+网络代理遵循环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（小写优先）与 `NO_PROXY`。
+若代理是 `socks5://` / `socks5h://`（Clash / mihomo 的 mixed-port 常见），karakuri 会自动
+改写为同一端口的 HTTP 代理连接（reqwest 未编译 SOCKS 支持以保持零额外依赖与小体积，
+而混合端口同时讲 HTTP 与 SOCKS，无需额外配置）；纯 `http(s)://` 代理与无代理环境行为不变。
+
 退出方式：输入 `/exit`，或按 `Ctrl-D`（EOF）。
 
 交互模式（stdin 是终端时）使用 rustyline 行编辑：

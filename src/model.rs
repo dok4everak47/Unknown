@@ -450,12 +450,83 @@ const COMPLETE_TIMEOUT: Duration = Duration::from_secs(120);
 fn blocking_client(
     overall_timeout: Option<Duration>,
 ) -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
-    let builder = reqwest::blocking::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    let mut builder = reqwest::blocking::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+
+    // SOCKS 代理兼容：reqwest 未启用 `socks` feature（零新依赖 + 控制体积），
+    // 环境里若有 socks*:// 代理（Clash/mihomo mixed-port 常见）会直接报
+    // "unsupported scheme socks5"。检测到时显式设置归一化为 http:// 的代理
+    // （mixed-port 同端口也讲 HTTP CONNECT）；显式 .proxy() 会关闭 system-proxy
+    // 的自动读取。无 socks 时完全不触碰，保留 reqwest 原生 http(s) 代理 + NO_PROXY。
+    let env_first = |keys: &[&str]| {
+        keys.iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    };
+    let https_v = env_first(&["https_proxy", "HTTPS_PROXY"]);
+    let http_v = env_first(&["http_proxy", "HTTP_PROXY"]);
+    let all_v = env_first(&["all_proxy", "ALL_PROXY"]);
+    if let Some((https_p, http_p)) =
+        socks_proxy_override(https_v.as_deref(), http_v.as_deref(), all_v.as_deref())
+    {
+        if let Some(u) = https_p {
+            builder = builder.proxy(reqwest::Proxy::https(&u)?);
+        }
+        if let Some(u) = http_p {
+            builder = builder.proxy(reqwest::Proxy::http(&u)?);
+        }
+    }
+
     let builder = match overall_timeout {
         Some(timeout) => builder.timeout(timeout),
         None => builder,
     };
     Ok(builder.build()?)
+}
+
+/// reqwest 未启用 `socks` feature，遇到 `socks5://` / `socks5h://` / `socks4://`
+/// 代理会报 "unsupported scheme socks5"。Clash / mihomo 的混合端口（mixed-port，
+/// 常见 7890）在同一端口同时讲 HTTP 与 SOCKS，故把 socks* scheme 改写为
+/// `http://`（authority/端口原样保留），让 reqwest 以 HTTP CONNECT 走同一端口。
+/// 非 socks scheme、无 `://` 的值原样返回。
+fn normalize_socks_proxy(url: &str) -> String {
+    if let Some(idx) = url.find("://")
+        && url[..idx].starts_with("socks")
+    {
+        return format!("http://{}", &url[idx + 3..]);
+    }
+    url.to_string()
+}
+
+/// 决策：当环境里存在 reqwest 不支持的 socks* 代理时，返回需要**显式**设置到
+/// `ClientBuilder` 的归一化代理 `(https 代理, http 代理)`；否则返回 `None`
+/// （全是 http(s) 代理或无代理——交给 reqwest system-proxy 原生处理，保留
+/// `NO_PROXY` 语义，行为零变化）。
+///
+/// 入参为已按优先级解析好的环境变量值：`https` = https_proxy/HTTPS_PROXY，
+/// `http` = http_proxy/HTTP_PROXY，`all` = all_proxy/ALL_PROXY（前两者的回退）。
+fn socks_proxy_override(
+    https: Option<&str>,
+    http: Option<&str>,
+    all: Option<&str>,
+) -> Option<(Option<String>, Option<String>)> {
+    let https_raw = https.or(all);
+    let http_raw = http.or(all);
+    let any_socks = [https_raw, http_raw]
+        .iter()
+        .flatten()
+        .any(|u| {
+            u.split("://")
+                .next()
+                .is_some_and(|s| s.starts_with("socks"))
+        });
+    if !any_socks {
+        return None;
+    }
+    Some((
+        https_raw.map(normalize_socks_proxy),
+        http_raw.map(normalize_socks_proxy),
+    ))
 }
 
 /// 有界回收流式读取线程：正常路径下服务端通常随 `[DONE]` 终止 body，线程在
@@ -1320,5 +1391,56 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}
         assert!(matches!(result, Err(crate::agent::AgentError::Model(_))));
         // 错误后 conversation 回滚：user 消息被移除
         assert!(conversation.is_empty());
+    }
+
+    /// normalize_socks_proxy：socks* scheme 改写为 http，其余原样。
+    #[test]
+    fn normalize_socks_proxy_rewrites_scheme_only() {
+        assert_eq!(
+            normalize_socks_proxy("socks5://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            normalize_socks_proxy("socks5h://example.com:1080"),
+            "http://example.com:1080"
+        );
+        assert_eq!(normalize_socks_proxy("socks4://h:1"), "http://h:1");
+        // 非 socks scheme / 无 scheme 原样。
+        assert_eq!(
+            normalize_socks_proxy("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            normalize_socks_proxy("https://proxy.corp:3128"),
+            "https://proxy.corp:3128"
+        );
+        assert_eq!(normalize_socks_proxy("127.0.0.1:7890"), "127.0.0.1:7890");
+    }
+
+    /// socks_proxy_override：仅当出现 socks* 代理时返回归一化结果，否则 None。
+    #[test]
+    fn socks_override_only_triggers_on_socks_scheme() {
+        // https 走 socks、http 走 http（典型 Clash mixed-port）：两者归一化为 http。
+        let r = socks_proxy_override(
+            Some("socks5://127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890"),
+            None,
+        )
+        .expect("socks present → override");
+        assert_eq!(r.0.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(r.1.as_deref(), Some("http://127.0.0.1:7890"));
+
+        // 仅 all_proxy 是 socks：http/https 都回退到它并归一化。
+        let r = socks_proxy_override(None, None, Some("socks5h://h:1080")).expect("all socks");
+        assert_eq!(r.0.as_deref(), Some("http://h:1080"));
+        assert_eq!(r.1.as_deref(), Some("http://h:1080"));
+
+        // 全是 http(s) 代理 → None（交给 reqwest system-proxy，保留 NO_PROXY）。
+        assert_eq!(
+            socks_proxy_override(Some("http://h:3128"), Some("http://h:3128"), None),
+            None
+        );
+        // 无任何代理 → None。
+        assert_eq!(socks_proxy_override(None, None, None), None);
     }
 }
